@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Мои дежурства</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23161412'/%3E%3Crect x='6' y='6' width='52' height='52' fill='%23d6221f'/%3E%3Ctext x='32' y='45' font-family='Arial' font-size='32' font-weight='800' text-anchor='middle' fill='%23fbf7ee'%3E24%3C/text%3E%3C/svg%3E">
+  <script src="/static/theme.js"></script>
+  <script src="/static/i18n.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div class="brand">
+          <div class="brand__mark">24</div>
+          <div class="brand__text">
+            <h1 id="unitName">Дежурная служба</h1>
+            <p>Личная страница сотрудника</p>
+          </div>
+        </div>
+        <div class="topbar__right">
+          <button class="theme-toggle lang-toggle" type="button" data-lang-toggle>EN</button>
+          <button class="theme-toggle" type="button" data-theme-toggle>Тёмная</button>
+          <div class="topbar__date" id="todayLabel"></div>
+          <div class="user-chip">
+            <span class="user-chip__text">
+              <b id="myUserName">Сотрудник</b>
+              <small>Личный кабинет</small>
+            </span>
+            <button class="btn btn--sm btn--ghost" type="button" id="logoutBtn">Выйти</button>
+          </div>
+        </div>
+      </div>
+    </header>
+    <main class="view" id="view">
+      <div class="loading">Загрузка…</div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script src="/static/my.js"></script>
+</body>
+</html>

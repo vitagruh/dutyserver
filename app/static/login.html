@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход — Суточные дежурства</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23161412'/%3E%3Crect x='6' y='6' width='52' height='52' fill='%23d6221f'/%3E%3Ctext x='32' y='45' font-family='Arial' font-size='32' font-weight='800' text-anchor='middle' fill='%23fbf7ee'%3E24%3C/text%3E%3C/svg%3E">
+  <script src="/static/theme.js"></script>
+  <script src="/static/i18n.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-page">
+  <button class="theme-toggle theme-toggle--floating lang-toggle lang-toggle--floating" type="button" data-lang-toggle>EN</button>
+  <button class="theme-toggle theme-toggle--floating" type="button" data-theme-toggle>Тёмная</button>
+  <main class="login-card">
+    <div class="login-card__brand">
+      <div class="brand__mark">24</div>
+      <div>
+        <h1>Суточные дежурства</h1>
+        <p>Вход в систему</p>
+      </div>
+    </div>
+    <form id="loginForm" class="form">
+      <div class="field">
+        <label for="loginUser">Логин</label>
+        <input id="loginUser" name="username" type="text" autocomplete="username" required autofocus>
+      </div>
+      <div class="field">
+        <label for="loginPass">Пароль</label>
+        <input id="loginPass" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="login-error" id="loginError" hidden></div>
+      <button class="btn btn--primary btn--block" type="submit" id="loginSubmit">Войти</button>
+    </form>
+    <p class="login-hint">
+      Сотрудник видит личный кабинет с календарём и заявками. Тимлид и администратор
+      работают с графиком, заявками и днями без покрытия.
+    </p>
+  </main>
+  <script src="/static/login.js"></script>
+</body>
+</html>

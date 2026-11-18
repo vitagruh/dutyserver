@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Суточные дежурства</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23161412'/%3E%3Crect x='6' y='6' width='52' height='52' fill='%23d6221f'/%3E%3Ctext x='32' y='45' font-family='Arial' font-size='32' font-weight='800' text-anchor='middle' fill='%23fbf7ee'%3E24%3C/text%3E%3C/svg%3E">
+  <script src="/static/theme.js"></script>
+  <script src="/static/i18n.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div class="brand">
+          <div class="brand__mark">24</div>
+          <div class="brand__text">
+            <h1 id="unitName">Дежурная служба</h1>
+            <p>Учёт и распределение суточных дежурств</p>
+          </div>
+        </div>
+        <nav class="tabs" id="tabs" aria-label="Разделы">
+          <button class="tab is-active" type="button" data-tab="schedule">График</button>
+          <button class="tab" type="button" data-tab="people">Сотрудники</button>
+          <button class="tab" type="button" data-tab="requests">Заявки<span class="tab__badge" id="requestBadge" hidden>0</span></button>
+          <button class="tab" type="button" data-tab="coverage">Требуют решения<span class="tab__badge tab__badge--danger" id="coverageBadge" hidden>0</span></button>
+          <button class="tab" type="button" data-tab="comps">Отгулы<span class="tab__badge" id="compBadge" hidden>0</span></button>
+          <button class="tab" type="button" data-tab="absences">Отсутствия</button>
+          <button class="tab" type="button" data-tab="stats">Статистика</button>
+          <button class="tab" type="button" data-tab="users" data-admin-only hidden>Аккаунты</button>
+          <button class="tab" type="button" data-tab="settings">Настройки</button>
+        </nav>
+        <div class="topbar__right">
+          <button class="theme-toggle lang-toggle" type="button" data-lang-toggle>EN</button>
+          <button class="theme-toggle" type="button" data-theme-toggle>Тёмная</button>
+          <div class="topbar__date" id="todayLabel"></div>
+          <div class="user-chip" id="userChip" hidden>
+            <span class="user-chip__text">
+              <b id="userName"></b>
+              <small id="userRole"></small>
+            </span>
+            <button class="btn btn--sm btn--ghost" type="button" id="logoutBtn">Выйти</button>
+          </div>
+        </div>
+      </div>
+    </header>
+    <main class="view" id="view">
+      <div class="loading">Загрузка…</div>
+    </main>
+  </div>
+
+  <div class="modal" id="modal" hidden>
+    <div class="modal__backdrop" data-close></div>
+    <div class="modal__panel" id="modalPanel" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header class="modal__head">
+        <h2 id="modalTitle"></h2>
+        <button class="icon-btn" type="button" data-close aria-label="Закрыть">×</button>
+      </header>
+      <div class="modal__body" id="modalBody"></div>
+      <footer class="modal__foot" id="modalFoot"></footer>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
