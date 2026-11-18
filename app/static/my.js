@@ -392,7 +392,7 @@
         event.preventDefault();
         const current = el('currentPassword').value;
         const next = el('newPassword').value;
-        if (next.length < 6) { toast('Пароль должен быть не короче 6 символов', 'error'); return; }
+        if (next.length < 8) { toast('Пароль должен быть не короче 8 символов', 'error'); return; }
         await api('/api/auth/password', {
           method: 'POST',
           body: { current_password: current, new_password: next },

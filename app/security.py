@@ -9,7 +9,7 @@ import json
 import secrets
 import time
 
-PBKDF2_ITERATIONS = 120_000
+PBKDF2_ITERATIONS = 600_000
 SESSION_TTL_SECONDS = 12 * 60 * 60
 
 
@@ -41,8 +41,8 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def validate_password(password: str) -> str | None:
-    if len(password) < 6:
-        return "Пароль должен быть не короче 6 символов"
+    if len(password) < 8:
+        return "Пароль должен быть не короче 8 символов"
     if len(password) > 128:
         return "Пароль слишком длинный"
     return None
@@ -65,12 +65,14 @@ def create_session(
     secret: str,
     tag: str = "",
     ttl: int = SESSION_TTL_SECONDS,
+    epoch: int = 0,
 ) -> str:
     payload = json.dumps(
         {
             "uid": int(user_id),
             "role": role,
             "pv": tag,
+            "ep": int(epoch),
             "exp": int(time.time()) + ttl,
         },
         separators=(",", ":"),

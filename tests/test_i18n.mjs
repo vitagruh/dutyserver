@@ -63,6 +63,40 @@ test('dynamic phrases are translated without touching names', () => {
   );
 });
 
+test('roulette dialog and dates are translated', () => {
+  assert.equal(
+    i18n.translate('Рулетка · 16 декабря 2026, среда', 'en'),
+    'Roulette · 16 December 2026, Wednesday',
+  );
+  assert.equal(
+    i18n.translate('16 декабря 2026, среда', 'en'),
+    '16 December 2026, Wednesday',
+  );
+  assert.equal(
+    i18n.translate('3 дежурства в этом месяце', 'en'),
+    '3 duties this month',
+  );
+  assert.equal(i18n.translate('Не участвуют: 2', 'en'), 'Not participating: 2');
+  assert.equal(
+    i18n.translate(
+      'отклонения: не может дежурить — согласованная заявка; на следующий день дежурство 09.12',
+      'en',
+    ),
+    'exceptions: can’t be on duty — approved request; duty the next day (09.12)',
+  );
+  assert.equal(
+    i18n.translate(
+      ', где M — число дежурств в декабре 2026. Чем меньше дежурств, тем выше шанс.',
+      'en',
+    ),
+    ', where M is the number of duties in December 2026. Fewer duties mean a higher chance.',
+  );
+  assert.equal(
+    i18n.translate('Шанс выше у тех, кто меньше дежурил в декабре 2026.', 'en'),
+    'Those who were on duty less in December 2026 have a higher chance.',
+  );
+});
+
 test('unknown data and russian mode stay unchanged', () => {
   assert.equal(i18n.translate('Александр Ковалёв', 'en'), 'Александр Ковалёв');
   assert.equal(i18n.translate('График', 'ru'), 'График');

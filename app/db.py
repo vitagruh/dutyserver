@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT NOT NULL DEFAULT '',
     rocketchat TEXT NOT NULL DEFAULT '',
     active INTEGER NOT NULL DEFAULT 1,
+    session_epoch INTEGER NOT NULL DEFAULT 0,
     last_login_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -249,6 +250,13 @@ def init_db() -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_people_token "
                 "ON people(token) WHERE token IS NOT NULL"
             )
+        user_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)")
+        }
+        if "session_epoch" not in user_columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0"
+            )
         draw_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(draws)")
         }
@@ -276,11 +284,20 @@ def init_db() -> None:
             )
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             username = os.environ.get("DUTY_ADMIN_USER", "admin").strip() or "admin"
-            password = os.environ.get("DUTY_ADMIN_PASSWORD", "admin123")
+            password = os.environ.get("DUTY_ADMIN_PASSWORD", "").strip()
+            generated = not password
+            if generated:
+                password = secrets.token_urlsafe(9)
             conn.execute(
                 "INSERT INTO users(username, password_hash, role) VALUES(?, ?, 'admin')",
                 (username, security.hash_password(password)),
             )
+            if generated:
+                print(
+                    f"Создан администратор «{username}», пароль: {password}. "
+                    "Смените его после входа.",
+                    flush=True,
+                )
 
 
 def load_settings(conn: sqlite3.Connection) -> dict[str, str]:

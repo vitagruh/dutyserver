@@ -44,6 +44,7 @@ def main() -> int:
     args = parser.parse_args()
 
     os.environ["DUTY_DB"] = args.db
+    os.environ.setdefault("DUTY_ADMIN_PASSWORD", "admin123")
 
     from app import db, engine, security
     from app.holidays import belarus_holidays

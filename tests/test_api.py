@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import db, security
-from app.main import app
+from app.main import app, reset_login_failures
 
 
 def weekday_on_or_after(start: date, weekday: int) -> date:
@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture()
 def client():
+    reset_login_failures()
     with TestClient(app) as test_client:
         with db.db() as conn:
             for table in (
@@ -77,7 +78,7 @@ def add_account(
     client: TestClient,
     person_id: int,
     username: str,
-    password: str = "pass123",
+    password: str = "pass1234",
     role: str = "employee",
     email: str = "",
 ) -> int:
@@ -95,7 +96,7 @@ def add_account(
     return response.json()["user"]["id"]
 
 
-def login_as(username: str, password: str = "pass123") -> TestClient:
+def login_as(username: str, password: str = "pass1234") -> TestClient:
     employee = TestClient(app)
     response = employee.post(
         "/api/auth/login", json={"username": username, "password": password}
@@ -569,7 +570,7 @@ def test_rbac_login_roles_and_password_change(client: TestClient):
     assert wrong.status_code == 400
     changed = employee.post(
         "/api/auth/password",
-        json={"current_password": "pass123", "new_password": "newpass123"},
+        json={"current_password": "pass1234", "new_password": "newpass123"},
     )
     assert changed.status_code == 200
     assert employee.get("/api/me").status_code == 200
@@ -1020,3 +1021,249 @@ def test_i18n_translations_with_node():
         timeout=60,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_health_and_security_headers(client: TestClient):
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert str(db.DB_PATH) not in health.text
+
+    headers = client.get("/api/schedule").headers
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+    assert "script-src 'self'" in headers["Content-Security-Policy"]
+    assert "Strict-Transport-Security" not in headers
+
+
+def test_login_rate_limit(client: TestClient):
+    anonymous = TestClient(app)
+    for _ in range(10):
+        response = anonymous.post(
+            "/api/auth/login", json={"username": "ghost", "password": "wrong-pass"}
+        )
+        assert response.status_code == 401
+    blocked = anonymous.post(
+        "/api/auth/login", json={"username": "ghost", "password": "wrong-pass"}
+    )
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) >= 1
+    reset_login_failures()
+    recovered = anonymous.post(
+        "/api/auth/login", json={"username": "ghost", "password": "wrong-pass"}
+    )
+    assert recovered.status_code == 401
+
+
+def test_logout_revokes_existing_session(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    add_account(client, ivanov, "ivanov")
+    employee = login_as("ivanov")
+    token = employee.cookies.get("duty_session")
+    assert token
+
+    stolen = TestClient(app)
+    assert stolen.get(
+        "/api/me", headers={"cookie": f"duty_session={token}"}
+    ).status_code == 200
+
+    employee.post("/api/auth/logout")
+    assert stolen.get(
+        "/api/me", headers={"cookie": f"duty_session={token}"}
+    ).status_code == 401
+
+
+def test_password_policy_min_length(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    response = client.post(
+        "/api/users",
+        json={
+            "username": "ivanov",
+            "password": "short12",
+            "role": "employee",
+            "person_id": ivanov,
+        },
+    )
+    assert response.status_code == 400
+
+    add_account(client, ivanov, "ivanov")
+    employee = login_as("ivanov")
+    rejected = employee.post(
+        "/api/auth/password",
+        json={"current_password": "pass1234", "new_password": "short12"},
+    )
+    assert rejected.status_code == 400
+
+
+def test_csv_export_neutralises_formulas(client: TestClient):
+    person = add_person(client, "=HYPERLINK(\"http://x\")")
+    created = client.post(
+        "/api/duties",
+        json={"date": MONDAY.isoformat(), "person_id": person, "note": "+SUM(1)"},
+    )
+    assert created.status_code == 200
+    export = client.get("/api/export", params={"month": MONTH})
+    assert export.status_code == 200
+    assert "'=HYPERLINK" in export.text
+    assert "'+SUM(1)" in export.text
+
+
+def test_relaxed_roulette_blocks_only_vacation_and_rest(client: TestClient):
+    absent = add_person(client, "Отпускной")
+    resting = add_person(client, "Отсыпной")
+    conflicted = add_person(client, "СЗаявкой")
+    free = add_person(client, "Свободный")
+    target = MONDAY + timedelta(days=21)
+
+    absence = client.post(
+        "/api/absences",
+        json={
+            "person_id": absent,
+            "date_from": target.isoformat(),
+            "date_to": target.isoformat(),
+            "kind": "vacation",
+        },
+    )
+    assert absence.status_code == 200
+    rest_duty = client.post(
+        "/api/duties",
+        json={
+            "date": (target - timedelta(days=1)).isoformat(),
+            "person_id": resting,
+        },
+    )
+    assert rest_duty.status_code == 200
+    with db.db() as conn:
+        conn.execute(
+            "INSERT INTO availability"
+            "(person_id, date_from, date_to, kind, reason, status) "
+            "VALUES(?, ?, ?, 'unavailable', 'учебный день', 'approved')",
+            (conflicted, target.isoformat(), target.isoformat()),
+        )
+
+    strict = client.get(
+        "/api/roulette", params={"date": target.isoformat()}
+    ).json()
+    by_name = {item["person_name"]: item for item in strict["candidates"]}
+    assert by_name["Отпускной"]["eligible"] is False
+    assert by_name["Отсыпной"]["eligible"] is False
+    assert by_name["СЗаявкой"]["eligible"] is False
+    assert by_name["Свободный"]["eligible"] is True
+
+    relaxed = client.get(
+        "/api/roulette", params={"date": target.isoformat(), "relaxed": 1}
+    ).json()
+    assert relaxed["relaxed"] is True
+    by_name = {item["person_name"]: item for item in relaxed["candidates"]}
+    assert by_name["Отпускной"]["eligible"] is False
+    assert by_name["Отсыпной"]["eligible"] is False
+    assert by_name["СЗаявкой"]["eligible"] is True
+    assert any(
+        "согласованная заявка" in reason
+        for reason in by_name["СЗаявкой"]["conflicts"]
+    )
+
+    blocked = client.post(
+        "/api/draw",
+        json={
+            "date": target.isoformat(),
+            "candidate_ids": [absent],
+            "mode": "equal",
+            "relaxed": True,
+            "seed": 1,
+        },
+    )
+    assert blocked.status_code == 409
+
+    drawn = client.post(
+        "/api/draw",
+        json={
+            "date": target.isoformat(),
+            "candidate_ids": [conflicted, free],
+            "mode": "equal",
+            "relaxed": True,
+            "seed": 5,
+        },
+    )
+    assert drawn.status_code == 200
+    result = drawn.json()
+    assert result["winner"]["personId"] in (conflicted, free)
+    if result["winner"]["personId"] == conflicted:
+        assert result["deviations"]
+    schedule = client.get("/api/schedule", params={"month": MONTH}).json()
+    duty = next(
+        day["duty"] for day in schedule["days"] if day["date"] == target.isoformat()
+    )
+    assert duty["personName"] == result["winner"]["personName"]
+
+
+def test_roulette_replaces_planned_duty(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    petrov = add_person(client, "Петров")
+    target = MONDAY + timedelta(days=21)
+    original = client.post(
+        "/api/duties",
+        json={"date": target.isoformat(), "person_id": ivanov},
+    )
+    assert original.status_code == 200
+    old_id = original.json()["duty"]["id"]
+
+    refused = client.post(
+        "/api/draw",
+        json={"date": target.isoformat(), "candidate_ids": [petrov], "seed": 3},
+    )
+    assert refused.status_code == 409
+
+    replaced = client.post(
+        "/api/draw",
+        json={
+            "date": target.isoformat(),
+            "candidate_ids": [petrov],
+            "seed": 3,
+            "replace": True,
+        },
+    )
+    assert replaced.status_code == 200
+    result = replaced.json()
+    assert result["replacedDutyId"] == old_id
+    assert result["winner"]["personId"] == petrov
+
+    schedule = client.get("/api/schedule", params={"month": MONTH}).json()
+    day = next(item for item in schedule["days"] if item["date"] == target.isoformat())
+    assert day["duty"]["personName"] == "Петров"
+    with db.db() as conn:
+        old = conn.execute(
+            "SELECT status FROM duties WHERE id = ?", (old_id,)
+        ).fetchone()
+    assert old["status"] == "cancelled"
+
+
+def test_roulette_replace_respects_scheduled_comp(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    petrov = add_person(client, "Петров")
+    target = SATURDAY + timedelta(days=14)
+    duty = client.post(
+        "/api/duties",
+        json={"date": target.isoformat(), "person_id": ivanov},
+    )
+    assert duty.status_code == 200
+    duty_id = duty.json()["duty"]["id"]
+    with db.db() as conn:
+        conn.execute(
+            "INSERT INTO comp_choices(duty_id, date, status) VALUES(?, ?, 'scheduled')",
+            (duty_id, (target + timedelta(days=3)).isoformat()),
+        )
+
+    refused = client.post(
+        "/api/draw",
+        json={
+            "date": target.isoformat(),
+            "candidate_ids": [petrov],
+            "seed": 3,
+            "replace": True,
+        },
+    )
+    assert refused.status_code == 409
+    assert "отгул" in refused.json()["detail"]
+

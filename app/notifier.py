@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import smtplib
+import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -156,7 +157,7 @@ def _deliver_email(settings: dict[str, str], recipient: str, subject: str, body:
     with smtplib.SMTP(host, port, timeout=10) as client:
         client.ehlo()
         if settings.get("smtp_tls", "1") == "1":
-            client.starttls()
+            client.starttls(context=ssl.create_default_context())
             client.ehlo()
         user = settings.get("smtp_user", "").strip()
         if user:

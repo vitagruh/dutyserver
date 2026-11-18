@@ -8,11 +8,13 @@ import random
 import secrets
 import sqlite3
 import statistics
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
@@ -74,6 +76,51 @@ ROLE_LABELS = {
     "employee": "Сотрудник",
 }
 SESSION_COOKIE = "duty_session"
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_SECONDS = 300
+CSP_HEADER = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; "
+    "object-src 'none'"
+)
+
+_login_failures: dict[str, list[float]] = {}
+
+
+def _login_key(request: Request, username: str) -> str:
+    host = request.client.host if request.client else "unknown"
+    return f"{host}|{username.strip().lower()}"
+
+
+def login_retry_after(key: str) -> int:
+    now = time.monotonic()
+    attempts = [
+        stamp
+        for stamp in _login_failures.get(key, [])
+        if now - stamp < LOGIN_WINDOW_SECONDS
+    ]
+    if attempts:
+        _login_failures[key] = attempts
+    else:
+        _login_failures.pop(key, None)
+    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+        return max(1, int(LOGIN_WINDOW_SECONDS - (now - attempts[0])) + 1)
+    return 0
+
+
+def note_login_failure(key: str) -> None:
+    if len(_login_failures) > 1000:
+        _login_failures.clear()
+    _login_failures.setdefault(key, []).append(time.monotonic())
+
+
+def reset_login_failures() -> None:
+    _login_failures.clear()
+
+
+def _secure_cookie(request: Request) -> bool:
+    return request.url.scheme == "https"
 
 
 @asynccontextmanager
@@ -122,6 +169,8 @@ class DrawIn(BaseModel):
     candidate_ids: list[int] = []
     seed: int | None = None
     mode: str = "load"
+    relaxed: bool = False
+    replace: bool = False
 
 
 class AutoPlanIn(BaseModel):
@@ -852,6 +901,7 @@ async def rbac_middleware(request: Request, call_next):
             and row["active"]
             and row["role"] == payload.get("role")
             and payload.get("pv") == security.password_tag(row["password_hash"])
+            and int(payload.get("ep") or 0) == int(row["session_epoch"] or 0)
         ):
             user = dict(row)
     request.state.user = user
@@ -884,6 +934,23 @@ async def rbac_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+    )
+    response.headers.setdefault("Content-Security-Policy", CSP_HEADER)
+    if _secure_cookie(request):
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
 @app.get("/login", include_in_schema=False)
 def login_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "login.html")
@@ -901,14 +968,25 @@ def index() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "db": str(db.DB_PATH)}
+    return {"status": "ok"}
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginIn, response: Response) -> dict[str, Any]:
+def login(payload: LoginIn, request: Request, response: Response) -> dict[str, Any]:
     username = payload.username.strip()
     if not username or not payload.password:
         raise HTTPException(status_code=400, detail="Укажите логин и пароль")
+    key = _login_key(request, username)
+    retry_after = login_retry_after(key)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Слишком много неудачных попыток входа. "
+                f"Повторите через {retry_after} с."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
     with db.db() as conn:
         row = conn.execute(
             "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
@@ -918,7 +996,9 @@ def login(payload: LoginIn, response: Response) -> dict[str, Any]:
             or not row["active"]
             or not security.verify_password(payload.password, row["password_hash"])
         ):
+            note_login_failure(key)
             raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+        _login_failures.pop(key, None)
         conn.execute(
             "UPDATE users SET last_login_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             "WHERE id = ?",
@@ -930,12 +1010,14 @@ def login(payload: LoginIn, response: Response) -> dict[str, Any]:
         row["role"],
         _session_secret(),
         security.password_tag(row["password_hash"]),
+        epoch=int(row["session_epoch"] or 0),
     )
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=security.SESSION_TTL_SECONDS,
         httponly=True,
+        secure=_secure_cookie(request),
         samesite="lax",
         path="/",
     )
@@ -948,7 +1030,14 @@ def auth_me(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/auth/logout")
-def logout(response: Response) -> dict[str, str]:
+def logout(request: Request, response: Response) -> dict[str, str]:
+    user = getattr(request.state, "user", None)
+    if user:
+        with db.db() as conn:
+            conn.execute(
+                "UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?",
+                (int(user["id"]),),
+            )
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"status": "ok"}
 
@@ -971,20 +1060,24 @@ def change_password(
             raise HTTPException(status_code=400, detail="Текущий пароль указан неверно")
         password_hash = security.hash_password(payload.new_password)
         conn.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?",
+            "UPDATE users SET password_hash = ?, "
+            "session_epoch = session_epoch + 1 WHERE id = ?",
             (password_hash, row["id"]),
         )
+        epoch = int(row["session_epoch"] or 0) + 1
     token = security.create_session(
         int(row["id"]),
         row["role"],
         _session_secret(),
         security.password_tag(password_hash),
+        epoch=epoch,
     )
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=security.SESSION_TTL_SECONDS,
         httponly=True,
+        secure=_secure_cookie(request),
         samesite="lax",
         path="/",
     )
@@ -1350,6 +1443,7 @@ def candidates(
 @app.get("/api/roulette")
 def roulette_preview(
     day: str = Query(..., alias="date"),
+    relaxed: bool = Query(False),
 ) -> dict[str, Any]:
     target = parse_day(day)
     with db.db() as conn:
@@ -1364,6 +1458,7 @@ def roulette_preview(
     evaluation = engine.evaluate_candidates(
         target, people, duties, absences, blocking_comps(comp_rows),
         holiday_set, rules, requests=requests,
+        relax=relaxed, keep_rest_blocking=relaxed,
     )
     month_counts = month_duty_counts(duties, target)
     equal = {
@@ -1398,6 +1493,7 @@ def roulette_preview(
                 "person_name": item["person_name"],
                 "eligible": item["eligible"],
                 "reasons": item["reasons"],
+                "conflicts": item["conflicts"],
                 "warnings": item["warnings"],
                 "total": item["load"]["total"],
                 "weekend": item["load"]["weekend"],
@@ -1420,6 +1516,7 @@ def roulette_preview(
         "holiday": holiday_names.get(target.isoformat()),
         "duty": duty_out(duty, names) if duty else None,
         "fairness_power": rules.fairness_power,
+        "relaxed": relaxed,
         "candidates": candidates,
     }
 
@@ -1531,16 +1628,39 @@ def draw(payload: DrawIn) -> dict[str, Any]:
     with db.db() as conn:
         _, rules = get_rules(conn)
         occupied = conn.execute(
-            "SELECT id FROM duties WHERE date = ? AND status <> 'cancelled'",
+            "SELECT id, person_id, status FROM duties "
+            "WHERE date = ? AND status <> 'cancelled'",
             (target_iso,),
         ).fetchone()
-        if occupied:
+        if occupied and not payload.replace:
             raise HTTPException(
                 status_code=409,
-                detail="День уже занят. Сначала снимите текущее дежурство.",
+                detail="День уже занят. Включите переигровку, чтобы заменить дежурного.",
             )
+        if occupied and occupied["status"] != "planned":
+            raise HTTPException(
+                status_code=409,
+                detail="Переиграть можно только запланированное дежурство.",
+            )
+        if occupied:
+            comp = conn.execute(
+                "SELECT status FROM comp_choices WHERE duty_id = ?",
+                (occupied["id"],),
+            ).fetchone()
+            if comp and comp["status"] in engine.COMP_BLOCKING_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Нельзя переиграть день: за текущее дежурство уже "
+                        "запланирован или использован отгул."
+                    ),
+                )
         people = load_people(conn)
         duties = load_duties(conn)
+        if occupied:
+            duties = [
+                d for d in duties if int(d["id"]) != int(occupied["id"])
+            ]
         absences = load_absences(conn)
         holidays, holiday_set = load_holidays(conn)
         comp_rows = load_comp_rows(conn)
@@ -1549,6 +1669,7 @@ def draw(payload: DrawIn) -> dict[str, Any]:
         evaluation = engine.evaluate_candidates(
             target, people, duties, absences, blocking_comps(comp_rows),
             holiday_set, rules, requests=requests,
+            relax=payload.relaxed, keep_rest_blocking=payload.relaxed,
         )
         by_id = {c["person_id"]: c for c in evaluation}
         eligible = [c for c in evaluation if c["eligible"]]
@@ -1627,10 +1748,13 @@ def draw(payload: DrawIn) -> dict[str, Any]:
                 "weight": round(float(c["weight"]), 4),
                 "probability": round(float(c["probability"]), 4),
                 "monthDuties": int(month_counts.get(c["person_id"], 0)),
+                "conflicts": c.get("conflicts", []),
                 "winner": c["person_id"] == winner["person_id"],
             }
             for c in pool
         ]
+
+        deviations = list(winner.get("conflicts") or [])
 
         if payload.mode == "equal":
             note = f"Рулетка · равные шансы, seed {seed}"
@@ -1638,9 +1762,20 @@ def draw(payload: DrawIn) -> dict[str, Any]:
             note = f"Рулетка · дежурства за {target:%m.%Y}, seed {seed}"
         else:
             note = f"Жребий, seed {seed}"
+        if deviations:
+            note += " · отклонения: " + "; ".join(deviations)
 
         try:
             with db.transaction(conn):
+                if occupied:
+                    conn.execute(
+                        "UPDATE duties SET status = 'cancelled' WHERE id = ?",
+                        (occupied["id"],),
+                    )
+                    conn.execute(
+                        "DELETE FROM comp_choices WHERE duty_id = ?",
+                        (occupied["id"],),
+                    )
                 cursor = conn.execute(
                     "INSERT INTO duties(date, person_id, status, source, note) "
                     "VALUES(?, ?, 'planned', 'draw', ?)",
@@ -1678,6 +1813,8 @@ def draw(payload: DrawIn) -> dict[str, Any]:
             "load": winner["load"],
             "monthDuties": int(month_counts.get(winner["person_id"], 0)),
         },
+        "deviations": deviations,
+        "replacedDutyId": int(occupied["id"]) if occupied else None,
         "candidates": snapshot,
     }
 
@@ -2935,6 +3072,14 @@ def stats() -> dict[str, Any]:
     }
 
 
+def _csv_cell(value: Any) -> str:
+    """Защита от формул Excel/Calc в пользовательских полях."""
+    text = "" if value is None else str(value)
+    if text.lstrip()[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
 @app.get("/api/export")
 def export_csv(
     month: str | None = None,
@@ -2993,12 +3138,12 @@ def export_csv(
             [
                 f"{day.day:02d}.{day.month:02d}.{day.year}",
                 WEEKDAY_NAMES[day.weekday()],
-                row["name"],
+                _csv_cell(row["name"]),
                 day_type,
                 DUTY_STATUS_LABELS.get(row["status"], row["status"]),
                 SOURCE_LABELS.get(row["source"], row["source"]),
                 comp,
-                row["note"],
+                _csv_cell(row["note"]),
             ]
         )
 
@@ -3323,7 +3468,18 @@ def update_settings(payload: SettingsIn, request: Request) -> dict[str, Any]:
             ("rocketchat_webhook", 500), ("public_url", 300),
         ):
             if key in data:
-                updates[key] = str(data[key]).strip()[:limit]
+                value = str(data[key]).strip()[:limit]
+                if key in ("rocketchat_webhook", "public_url") and value:
+                    parsed = urlparse(value)
+                    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "Адрес вебхука и публичный адрес должны "
+                                "начинаться с http:// или https://"
+                            ),
+                        )
+                updates[key] = value
 
         if "smtp_password" in data and str(data["smtp_password"]):
             updates["smtp_password"] = str(data["smtp_password"])[:200]

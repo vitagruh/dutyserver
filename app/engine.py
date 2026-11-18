@@ -123,12 +123,14 @@ def evaluate_candidates(
     rules: Rules,
     requests: Sequence[dict[str, Any]] = (),
     relax: bool = False,
+    keep_rest_blocking: bool = False,
 ) -> list[dict[str, Any]]:
     """Все активные сотрудники с отметкой доступности и причинами отказа.
 
     relax=True переносит отпуска, отсыпные/интервалы и согласованные заявки
     из блокирующих причин в конфликты: это пул для решения тимлида, а не
-    штатное распределение.
+    штатное распределение. keep_rest_blocking=True оставляет жёсткими только
+    отсутствие и отсыпной день — режим рулетки «только отпуск и отсыпной».
     """
     target = as_date(day)
     target_iso = target.isoformat()
@@ -175,19 +177,24 @@ def evaluate_candidates(
             notes.setdefault(person_id, []).append("просил не назначать")
 
     result: list[dict[str, Any]] = []
+    hard_absence_or_rest = not relax or keep_rest_blocking
+    hard_other = not relax
     for person in active_people:
         person_id = int(person["id"])
         reasons: list[str] = []
         conflicts: list[str] = []
-        soft = conflicts if relax else reasons
         if person_id in on_duty_today:
             reasons.append("в этот день уже назначено дежурство")
         if person_id in absent:
-            soft.append("отсутствие: отпуск / болезнь / командировка")
+            (reasons if hard_absence_or_rest else conflicts).append(
+                "отсутствие: отпуск / болезнь / командировка"
+            )
         if person_id in comp_today:
-            reasons.append("в этот день оформлен отгул")
+            (reasons if hard_other else conflicts).append("в этот день оформлен отгул")
         if person_id in unavailable:
-            soft.append("не может дежурить — согласованная заявка")
+            (reasons if hard_other else conflicts).append(
+                "не может дежурить — согласованная заявка"
+            )
 
         for duty_date in duty_dates.get(person_id, []):
             diff = (duty_date - target).days
@@ -196,11 +203,17 @@ def evaluate_candidates(
                 continue
             if distance < rules.min_gap_days:
                 if diff < 0 and distance <= rules.rest_days:
-                    soft.append(f"отсыпной после дежурства {short_date(duty_date)}")
+                    (reasons if hard_absence_or_rest else conflicts).append(
+                        f"отсыпной после дежурства {short_date(duty_date)}"
+                    )
                 elif diff > 0 and distance <= rules.rest_days:
-                    soft.append(f"на следующий день дежурство {short_date(duty_date)}")
+                    (reasons if hard_other else conflicts).append(
+                        f"на следующий день дежурство {short_date(duty_date)}"
+                    )
                 else:
-                    soft.append(f"малый интервал с дежурством {short_date(duty_date)}")
+                    (reasons if hard_other else conflicts).append(
+                        f"малый интервал с дежурством {short_date(duty_date)}"
+                    )
 
         reasons = list(dict.fromkeys(reasons))
         result.append(

@@ -382,7 +382,8 @@
           <button class="btn btn--ghost btn--sm" type="button" id="todayBtn">Сегодня</button>
         </div>
         <div class="head-actions">
-          <button class="btn btn--primary" type="button" id="autoPlanBtn">Автораспределение</button>
+          <button class="btn btn--primary" type="button" id="rouletteOpenBtn">Рулетка</button>
+          <button class="btn btn--ghost" type="button" id="autoPlanBtn">Автораспределение</button>
           <a class="btn btn--ghost" href="/api/export/schedule.xlsx?month=${encodeURIComponent(S.month)}">Excel для печати</a>
           <a class="btn btn--ghost" href="/api/export?month=${encodeURIComponent(S.month)}">Экспорт CSV</a>
         </div>
@@ -446,6 +447,7 @@
     el('nextMonth').addEventListener('click', act(() => loadSchedule(shiftMonth(S.month, 1))));
     el('todayBtn').addEventListener('click', act(() => loadSchedule(S.today.slice(0, 7))));
     el('autoPlanBtn').addEventListener('click', () => openAutoPlan());
+    el('rouletteOpenBtn').addEventListener('click', () => openRoulettePicker());
     $$('#view [data-day]').forEach((node) => {
       node.addEventListener('click', act(() => openDay(node.dataset.day)));
     });
@@ -1413,7 +1415,7 @@
             </div>
             <div class="field">
               <label for="userPassword">${isEdit ? 'Новый пароль' : 'Пароль'}</label>
-              <input id="userPassword" name="password" type="password" minlength="6" maxlength="128" ${isEdit ? '' : 'required'} autocomplete="new-password" placeholder="${isEdit ? 'оставьте пустым, чтобы не менять' : 'не короче 6 символов'}">
+              <input id="userPassword" name="password" type="password" minlength="8" maxlength="128" ${isEdit ? '' : 'required'} autocomplete="new-password" placeholder="${isEdit ? 'оставьте пустым, чтобы не менять' : 'не короче 8 символов'}">
             </div>
             <div class="field">
               <label for="userRole">Роль</label>
@@ -2847,6 +2849,7 @@
         monthDuties: Number(candidate.month_duties || 0),
         probability: Number(equal ? candidate.equal_probability : candidate.month_probability),
         weight: Number(equal ? candidate.equal_weight : candidate.month_weight),
+        conflicts: candidate.conflicts || [],
         color: ROULETTE_COLORS[index % ROULETTE_COLORS.length],
       }));
   }
@@ -2902,6 +2905,7 @@
         <div class="roulette-list__text">
           <div class="roulette-list__name">${esc(participant.name)}</div>
           <div class="small muted">${participant.monthDuties} ${plural(participant.monthDuties, 'дежурство', 'дежурства', 'дежурств')} в этом месяце</div>
+          ${participant.conflicts?.length ? `<div class="small muted">отклонения: ${esc(participant.conflicts.join('; '))}</div>` : ''}
         </div>
         <span class="roulette-list__prob">${pct(participant.probability)}</span>
       </div>
@@ -2938,6 +2942,9 @@
         </div>
         <span class="pill pill--used" style="margin-left:auto">назначен</span>
       </div>
+      ${result.deviations?.length ? `
+        <div class="banner banner--weekend small">Отклонения от правил: ${esc(result.deviations.join('; '))}</div>
+      ` : ''}
       <div class="proof-strip">
         <div>
           <span class="proof-strip__label">${esc(DRAW_MODE_LABEL[result.mode] || 'Рулетка')} · seed</span>
@@ -2963,19 +2970,25 @@
         <div>
           <div class="roulette__date">${esc(fullDate(data.date))}</div>
           <div class="small muted">${dayType} · выбранный сотрудник сразу получает дежурство</div>
+          ${data.duty ? `<div class="small muted">${esc(`Сейчас дежурит: ${data.duty.personName} — день будет переигран`)}</div>` : ''}
         </div>
         <div class="segmented" role="group" aria-label="Режим рулетки">
           <button type="button" class="segmented__btn is-active" data-roulette-mode="month" aria-pressed="true">Дежурства за месяц</button>
           <button type="button" class="segmented__btn" data-roulette-mode="equal" aria-pressed="false">Равные шансы</button>
         </div>
       </div>
+      <label class="check" style="margin-bottom:14px">
+        <input type="checkbox" id="rouletteRelaxed" ${data.relaxed ? 'checked' : ''}>
+        <span>Не блокировать интервал, отгул и заявки — исключать только отпуск и отсыпной</span>
+      </label>
     `;
     if (!eligible.length) {
       return `
         <div class="roulette">${head}
           <div class="banner banner--danger">
-            Нет доступных сотрудников: у всех есть отпуск, отсыпной, интервал или согласованная заявка.
-            День можно разобрать в разделе «Требуют решения».
+            ${data.relaxed
+              ? 'Нет сотрудников вне отпуска и отсыпного.'
+              : 'Нет доступных сотрудников: у всех есть отпуск, отсыпной, интервал или согласованная заявка. Включите послабление выше или разберите день в разделе «Требуют решения».'}
           </div>
         </div>
       `;
@@ -3041,8 +3054,17 @@
     });
   }
 
-  function bindRoulette(data, body, footEl) {
+  function bindRoulette(data, body, footEl, replace) {
     const eligible = data.candidates.filter((candidate) => candidate.eligible);
+    const relaxedToggle = $('#rouletteRelaxed', body);
+    if (relaxedToggle) {
+      relaxedToggle.addEventListener('change', act(async () => {
+        await openRoulette(data.date, {
+          replace,
+          relaxed: relaxedToggle.checked,
+        });
+      }));
+    }
     if (!eligible.length) return;
 
     let mode = 'month';
@@ -3092,6 +3114,8 @@
             date: data.date,
             candidate_ids: participants.map((participant) => participant.id),
             mode,
+            relaxed: Boolean(data.relaxed),
+            replace,
           },
         });
       } catch (error) {
@@ -3116,26 +3140,37 @@
       if (hub) hub.textContent = initials(result.winner.personName);
       const resultEl = $('#rouletteResult', body);
       if (resultEl) resultEl.innerHTML = rouletteWinnerHtml(result, participants);
-      hint.textContent = `Дежурство назначено: ${result.winner.personName}.`;
-      spinButton.textContent = 'Назначено';
+      const done = replace
+        ? `Дежурство переназначено: ${result.winner.personName}.`
+        : `Дежурство назначено: ${result.winner.personName}.`;
+      hint.textContent = done;
+      spinButton.textContent = replace ? 'Переназначено' : 'Назначено';
       spinning = false;
       finished = true;
-      toast(`Дежурство назначено: ${result.winner.personName}`);
+      toast(done);
       await loadSchedule(S.month);
     }));
   }
 
-  async function openRoulette(dateStr) {
+  async function openRoulette(dateStr, options = {}) {
+    let { replace = false, relaxed = false } = options;
     let data;
     try {
-      data = await api(`/api/roulette?date=${encodeURIComponent(dateStr)}`);
+      const query = `date=${encodeURIComponent(dateStr)}${relaxed ? '&relaxed=1' : ''}`;
+      data = await api(`/api/roulette?${query}`);
     } catch (error) {
       toast(error.message, 'error');
       return;
     }
     if (data.duty) {
-      toast('На этот день уже назначено дежурство', 'error');
-      return;
+      if (data.duty.status !== 'planned') {
+        toast('Переиграть можно только запланированное дежурство', 'error');
+        return;
+      }
+      if (!replace) {
+        if (!confirm(`На ${fullDate(dateStr)} уже дежурит ${data.duty.personName}. Переиграть день?`)) return;
+        replace = true;
+      }
     }
     const hasEligible = data.candidates.some((candidate) => candidate.eligible);
     openModal({
@@ -3146,10 +3181,45 @@
         ? `
           <div class="foot-info small muted" id="rouletteHint"></div>
           <button class="btn btn--ghost" type="button" data-close>Закрыть</button>
-          <button class="btn btn--primary" type="button" id="rouletteSpin">Крутить</button>
+          <button class="btn btn--primary" type="button" id="rouletteSpin">${replace ? 'Переиграть' : 'Крутить'}</button>
         `
         : '<button class="btn btn--primary" type="button" data-close>Закрыть</button>',
-      bind: (body, footEl) => bindRoulette(data, body, footEl),
+      bind: (body, footEl) => bindRoulette(data, body, footEl, replace),
+    });
+  }
+
+  async function openRoulettePicker() {
+    const defaultValue = S.today || new Date().toISOString().slice(0, 10);
+    openModal({
+      title: 'Рулетка',
+      body: `
+        <div class="form-row">
+          <label class="check" style="flex-direction:column;align-items:flex-start">
+            <span class="small muted">Дата дежурства</span>
+            <input type="date" id="rouletteDate" value="${esc(defaultValue)}">
+          </label>
+        </div>
+        <div class="small muted">
+          Рулетка исключает сотрудников в отпуске и на отсыпном. Если день уже занят,
+          дежурного можно переиграть.
+        </div>
+      `,
+      foot: `
+        <button class="btn btn--ghost" type="button" data-close>Отмена</button>
+        <button class="btn btn--primary" type="button" id="roulettePickGo">Открыть рулетку</button>
+      `,
+      bind: (body, footEl) => {
+        $('#roulettePickGo', footEl).addEventListener('click', act(async () => {
+          const dateInput = $('#rouletteDate', body);
+          const value = dateInput ? dateInput.value : '';
+          if (!value) {
+            toast('Выберите дату', 'error');
+            return;
+          }
+          closeModal();
+          await openRoulette(value);
+        }));
+      },
     });
   }
 

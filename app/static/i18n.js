@@ -447,6 +447,35 @@
     "Крутить": "Spin",
     "Назначено": "Assigned",
     "На этот день уже назначено дежурство": "A duty is already assigned to this day",
+    "Открыть рулетку": "Open the roulette",
+    "Дата дежурства": "Duty date",
+    "Выберите дату": "Choose a date",
+    "Переиграть": "Re-spin",
+    "Переназначено": "Re-assigned",
+    "Переиграть можно только запланированное дежурство": "Only a planned duty can be re-spun",
+    "Не блокировать интервал, отгул и заявки — исключать только отпуск и отсыпной": "Do not block for interval, comp day or requests — exclude only vacation and rest day",
+    "Нет сотрудников вне отпуска и отсыпного.": "No employees outside vacation and rest days.",
+    "Рулетка исключает сотрудников в отпуске и на отсыпном. Если день уже занят, дежурного можно переиграть.": "The roulette excludes employees on vacation or a rest day. If the day is already assigned, the duty can be re-spun.",
+    "Нет доступных сотрудников: у всех есть отпуск, отсыпной, интервал или согласованная заявка. Включите послабление выше или разберите день в разделе «Требуют решения».": "No available employees: everyone is on vacation or a rest day, has a short interval or an approved request. Enable the relaxation above or resolve the day under “Needs attention”.",
+    "День уже занят. Включите переигровку, чтобы заменить дежурного.": "The day is already assigned. Enable re-spin to replace the duty.",
+    "Нельзя переиграть день: за текущее дежурство уже запланирован или использован отгул.": "The day cannot be re-spun: a comp day for the current duty is already scheduled or used.",
+    "Переиграть можно только запланированное дежурство.": "Only a planned duty can be re-spun.",
+    "Участники": "Participants",
+    "Режим рулетки": "Roulette mode",
+    "Рабочий день · выбранный сотрудник сразу получает дежурство": "Working day · the selected employee gets the duty immediately",
+    "Выходной день · выбранный сотрудник сразу получает дежурство": "Day off · the selected employee gets the duty immediately",
+    "С учётом дежурств за месяц.": "Monthly duties are counted.",
+    "Вес = (M": "Weight = (M",
+    "Равные шансы.": "Equal chances.",
+    "Дежурства не учитываются: у каждого участника вес 1, вероятность = 1 / число участников.": "Duties are not counted: each participant has weight 1, probability = 1 / number of participants.",
+    "назначен": "assigned",
+    "в этот день уже назначено дежурство": "a duty is already assigned on this day",
+    "отсутствие: отпуск / болезнь / командировка": "absence: vacation / sick leave / business trip",
+    "в этот день оформлен отгул": "a comp day is arranged on this day",
+    "не может дежурить — согласованная заявка": "can’t be on duty — approved request",
+    "заявка «не могу» ждёт согласования": "“can’t” request awaiting approval",
+    "просил не назначать (согласовано)": "asked not to be scheduled (approved)",
+    "просил не назначать": "asked not to be scheduled",
 
     // ===== Личный кабинет =====
     "Сессия истекла — войдите заново": "The session expired — sign in again",
@@ -483,7 +512,7 @@
     "Новый пароль": "New password",
     "Сменить пароль": "Change password",
     "Выберите дни в календаре": "Select days in the calendar",
-    "Пароль должен быть не короче 6 символов": "The password must be at least 6 characters",
+    "Пароль должен быть не короче 8 символов": "The password must be at least 8 characters",
     "Пароль изменён": "Password changed",
     "Отозвать заявку?": "Withdraw the request?",
     "Заявка отозвана": "Request withdrawn",
@@ -543,6 +572,7 @@
     "Радуница": "Radunitsa",
     "Праздник труда": "Labour Day",
     "День Победы": "Victory Day",
+    "День Независимости": "Independence Day",
     "День Независимости Республики Беларусь": "Independence Day of Belarus",
     "Рождество Христово (католическое)": "Catholic Christmas",
     "День Октябрьской революции": "October Revolution Day",
@@ -600,8 +630,30 @@
     'сентябрь': 'September', 'октябрь': 'October', 'ноябрь': 'November', 'декабрь': 'December',
     'января': 'January', 'февраля': 'February', 'марта': 'March', 'апреля': 'April',
     'мая': 'May', 'июня': 'June', 'июля': 'July', 'августа': 'August',
-    'сентября': 'September', 'октября': 'October', 'ноября': 'November', 'декабря': 'December'
+    'сентября': 'September', 'октября': 'October', 'ноября': 'November', 'декабря': 'December',
+    'январе': 'January', 'феврале': 'February', 'марте': 'March', 'апреле': 'April',
+    'мае': 'May', 'июне': 'June', 'июле': 'July', 'августе': 'August',
+    'сентябре': 'September', 'октябре': 'October', 'ноябре': 'November', 'декабре': 'December'
   };
+
+  const WEEKDAYS = {
+    'понедельник': 'Monday', 'вторник': 'Tuesday', 'среда': 'Wednesday',
+    'четверг': 'Thursday', 'пятница': 'Friday', 'суббота': 'Saturday',
+    'воскресенье': 'Sunday'
+  };
+
+  function localizeDate(text) {
+    return String(text)
+      .replace(/(\d{1,2})\s+([а-яё]+)\s+(\d{4}),\s*([а-яё]+)/gi, (match, day, month, year, weekday) => {
+        const monthEn = MONTHS[month.toLowerCase()];
+        const dayEn = WEEKDAYS[weekday.toLowerCase()];
+        return monthEn && dayEn ? `${day} ${monthEn} ${year}, ${dayEn}` : match;
+      })
+      .replace(/([а-яё]+)\s+(\d{4})/gi, (match, month, year) => {
+        const monthEn = MONTHS[month.toLowerCase()];
+        return monthEn ? `${monthEn} ${year}` : match;
+      });
+  }
 
   const RULES = [
     [/^Пруф жеребьёвки №(\d+) — дежурства$/, 'Draw proof #$1 — duties'],
@@ -609,6 +661,10 @@
     [/^(.+) — мои дежурства$/, '$1 — my duties'],
     [/^(.+) — суточные дежурства$/, (match, unit) => ((EXACT[unit.trim()] || unit) + ' — 24-hour duties')],
     [/^([а-яё]+)\s+(\d{4})$/i, (match, month, year) => (MONTHS[month.toLowerCase()] ? MONTHS[month.toLowerCase()] + ' ' + year : match)],
+    [/^(\d{1,2}) ([а-яё]+) (\d{4}), ([а-яё]+)$/i, (match) => localizeDate(match)],
+    [/^Не участвуют: (\d+)$/, 'Not participating: $1'],
+    [/^Колесо рулетки, участников: (\d+)$/, 'Roulette wheel, participants: $1'],
+    [/^Праздник: (.+) · выбранный сотрудник сразу получает дежурство$/, (match, name) => 'Holiday: ' + translate(name, 'en') + ' · the selected employee gets the duty immediately'],
     [/^(\d+) (?:праздник|праздника|праздников) в месяце$/, (match, n) => n + (n === '1' ? ' holiday' : ' holidays') + ' this month'],
     [/^из (\d+) (?:день|дня|дней)$/, 'of $1 days'],
     [/^(\d+) (?:активных|активен)$/, '$1 active'],
@@ -666,6 +722,19 @@
     [/^Назначено (\d+) (?:дежурство|дежурства|дежурств) · seed (.+)$/, 'Assigned $1 duties · seed $2'],
     [/^Дежурство назначено: (.+)\.$/, 'Duty assigned: $1.'],
     [/^Дежурство назначено: (.+)$/, 'Duty assigned: $1'],
+    [/^Дежурство переназначено: (.+)\.$/, 'Duty re-assigned: $1.'],
+    [/^На (.+) уже дежурит (.+)\. Переиграть день\?$/, 'On $1 $2 is already on duty. Re-spin the day?'],
+    [/^Сейчас дежурит: (.+) — день будет переигран$/, 'Currently on duty: $1 — the day will be re-spun'],
+    [/^отклонения: (.+)$/, (match, list) => 'exceptions: ' + translateList(list)],
+    [/^Отклонения от правил: (.+)$/, (match, list) => 'Rule exceptions: ' + translateList(list)],
+    [/^отсыпной после дежурства (\d{2}\.\d{2})$/, 'rest day after duty on $1'],
+    [/^на следующий день дежурство (\d{2}\.\d{2})$/, 'duty the next day ($1)'],
+    [/^малый интервал с дежурством (\d{2}\.\d{2})$/, 'short interval with the duty on $1'],
+    [/^(\d+) (?:дежурство|дежурства|дежурств) в этом месяце$/, (match, n) => n + (n === '1' ? ' duty' : ' duties') + ' this month'],
+    [/^(\d+) (?:дежурство|дежурства|дежурств) в месяце$/, (match, n) => n + (n === '1' ? ' duty' : ' duties') + ' in the month'],
+    [/^([\d.,]+%) · (\d+) (?:дежурство|дежурства|дежурств) в месяце · (\d{2}\.\d{2}\.\d{4})$/, (match, chance, n, date) => chance + ' · ' + n + (n === '1' ? ' duty' : ' duties') + ' in the month · ' + date],
+    [/^, где M — число дежурств в (.+)\. Чем меньше дежурств, тем выше шанс\.$/, (match, month) => ', where M is the number of duties in ' + localizeDate(month) + '. Fewer duties mean a higher chance.'],
+    [/^(.+) · seed$/, (match, label) => translate(label, 'en') + ' · seed'],
     [/^Рулетка · (.+)$/, 'Roulette · $1'],
     [/^Не удалось загрузить данные (.+)$/, 'Failed to load data: $1'],
     [/^Кабинет недоступен (.+)$/, 'Account unavailable: $1'],
@@ -675,7 +744,7 @@
     [/^Назначено с отступлениями: (.+)$/, 'Assigned with exceptions: $1'],
     [/^Снять с контроля: (.+)$/, 'Dismiss: $1'],
     [/^Назначение на (.+)$/, 'Assignment for $1'],
-    [/^Шанс выше у тех, кто меньше дежурил в (.+)$/, 'Those who were on duty less in $1 have a higher chance.'],
+    [/^Шанс выше у тех, кто меньше дежурил в (.+)\.$/, (match, month) => 'Those who were on duty less in ' + localizeDate(month) + ' have a higher chance.'],
     [/^Отсыпной: (\d+) дн\.; минимальный интервал: (\d+) дн\.$/, 'Rest days: $1; minimum interval: $2 days.'],
     [/^Вес = \(Lmax − L \+ 1\) × ([\d.,]+), где L — взвешенная нагрузка \(выходное дежурство = ([\d.,]+)\)\. Вероятность = вес \/ сумма весов отмеченных доступных кандидатов\.$/, 'Weight = (Lmax − L + 1) × $1, where L is the weighted load (a weekend duty = $2). Probability = weight / sum of weights of the selected available candidates.'],
     [/^Взвешенная нагрузка = число будних дежурств × 1 \+ число выходных\/праздничных × ([\d.,]+)\. При жеребьёвке вес кандидата равен$/, 'Weighted load = weekday duties × 1 + weekend/holiday duties × $1. In a draw, a candidate’s weight is'],
@@ -686,7 +755,8 @@
     [/^Провести жеребьёвку \(\s*(\d+)\s*\)$/, 'Run the draw ($1)'],
     [/^(\d+) (?:дежурство|дежурства|дежурств)$/, (match, n) => n + (n === '1' ? ' duty' : ' duties')],
     [/^(\d+) (?:день|дня|дней)$/, (match, n) => n + (n === '1' ? ' day' : ' days')],
-    [/^(.+) коэф\. (.+)$/, '$1 coeff. $2']
+    [/^(.+) коэф\. (.+)$/, '$1 coeff. $2'],
+    [/^— (.+)$/, (match, rest) => '— ' + translateList(rest)]
   ];
 
   function withSpacing(original, core) {
@@ -708,9 +778,13 @@
       const output = typeof replacement === 'function'
         ? replacement.apply(null, match)
         : core.replace(pattern, replacement);
-      return withSpacing(text, output);
+      return withSpacing(text, localizeDate(output));
     }
     return text;
+  }
+
+  function translateList(list) {
+    return String(list).split('; ').map((item) => translate(item, 'en')).join('; ');
   }
 
   function t(text) {
