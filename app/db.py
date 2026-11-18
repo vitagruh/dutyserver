@@ -137,6 +137,24 @@ CREATE INDEX IF NOT EXISTS ix_availability_person
     ON availability(person_id, date_from, date_to);
 CREATE INDEX IF NOT EXISTS ix_availability_status ON availability(status);
 
+CREATE TABLE IF NOT EXISTS absence_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    date_from TEXT NOT NULL,
+    date_to TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'vacation'
+        CHECK (kind IN ('vacation','trip')),
+    reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','approved','declined')),
+    absence_id INTEGER REFERENCES absences(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_absence_requests_person
+    ON absence_requests(person_id, date_from, date_to);
+CREATE INDEX IF NOT EXISTS ix_absence_requests_status ON absence_requests(status);
+
 CREATE TABLE IF NOT EXISTS draws (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,

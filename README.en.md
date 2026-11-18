@@ -103,6 +103,11 @@ Request types:
 * **«Предпочитаю не дежурить» (I prefer not to work this day)** — a soft request.
   Assignment is not forbidden, but auto-distribution skips such an employee if a
   no-extra-load alternative is available. The candidate card shows a warning.
+* **«Отпуск» / «Командировка» (Vacation / Business trip)** — a period request
+  "from … to …". On the page you pick the type and start/end dates; the selected
+  days are highlighted in the calendar. Once approved, an absence of the matching
+  kind is created: the employee is excluded from assignments for the whole period
+  and the record appears in the «Отсутствия» (Absences) section.
 
 Requests go through approval: `ожидает` (pending) → `согласована` (approved) /
 `отклонена` (rejected). A request cannot be approved if the employee already has an
@@ -114,8 +119,11 @@ configured).
 Anti-abuse limits:
 
 * current date and forward only, horizon `request_horizon_days` (90 days);
-* no more than `request_month_limit` days per month per employee (10, 0 — no limit);
-* overlapping requests are not allowed;
+* no more than `request_month_limit` days per month per employee (10, 0 — no limit)
+  for "cannot work" / "prefer not to work" requests; vacation and business trips are
+  not limited by the monthly cap but cannot exceed 366 days;
+* overlapping requests, or requests for days already recorded as an absence, are
+  not allowed;
 * requests from an inactive employee are not accepted.
 
 Lists and decisions are in the «Заявки» (Requests) section; a pending request
@@ -295,7 +303,8 @@ The SMTP password is not returned by the API — only the `smtp_password_set` fl
   * **draw audit** with a proof link and the load formula.
 * **Аккаунты (Accounts)** — accounts, roles, links to employees, passwords.
 * **Настройки (Settings)** — rules, weights, request limits, the holidays reference,
-  notifications and the send log (notifications — administrator only).
+  notifications and the send log (notifications — administrator only), and the
+  database backup.
 
 ### Themes
 
@@ -343,6 +352,19 @@ Print layout: A4 landscape, headers and footers, signature lines. The XLSX gener
 is written on the standard library (`zipfile` + OOXML), no external dependencies are
 needed.
 
+The **«ЧБ для печати» (B/W for printing)** button exports the same schedule in
+monochrome (`/api/export/schedule-bw.xlsx`) for black-and-white printers. The legend
+on the first sheet: `Д` — duty, `О` — vacation, `К` — business trip, `Б` — sick
+leave, `Н` — other absence; weekend columns are filled grey, holidays are hatched.
+The second sheet «Список ЧБ» (B/W List) lists per date the duty officer, absences
+and notes.
+
+**Backup.** In the administrator settings the «Скачать копию базы» (Download
+database copy) button (`GET /api/backup`) returns a consistent SQLite snapshot made
+through the backup API. The copy is converted out of WAL mode, so it opens as a plain
+`.db` without sidecar files. It contains all data, including password hashes and the
+SMTP password, hence administrator-only access.
+
 ## Tests
 
 ```bash
@@ -353,15 +375,17 @@ node --test tests/test_i18n.mjs   # dictionary and translation rules
 Coverage: compatibility rules, recovery days, holidays, probabilities, draw
 reproducibility and proof verification (hash, sum of probabilities, independent
 recomputation of the winner, archived draws without a proof), auto-distribution,
-comp days, employee requests, limits and approval, login and roles (RBAC), passwords,
+comp days, employee requests, vacation and business-trip period requests, limits and
+approval, login and roles (RBAC), passwords,
 uncovered days and assignments over the rules, the candidate pool with a coefficient,
-the weekday matrix, statistics dashboards, the schedule Excel export, the
+the weekday matrix, statistics dashboards, the schedule Excel export, the B/W export
+with legend and absences, the database backup (admin-only, restore check), the
 notification queue, roulette modes (equal chances and weights by duties this month),
 the relaxed mode (vacation and recovery day only), re-rolling an occupied day, CSV
 formula injection protection, security headers, login attempt limiting, session
 revocation, the minimum password length, the presence of the RU/EN switch on all
 pages, dictionary completeness and translation of roulette dates and phrases —
-**44 tests** in pytest plus 5 translation checks in Node.
+**47 tests** in pytest plus 5 translation checks in Node.
 
 ## Structure
 
@@ -390,7 +414,7 @@ tests/          pytest; test_i18n.mjs — dictionary checks in Node
 |---|---|---|---|
 | POST | `/api/auth/login`, `/api/auth/logout` | sign in and out | everyone |
 | GET | `/api/auth/me`, POST `/api/auth/password` | current user, password change | everyone |
-| GET | `/api/me`, POST/DELETE `/api/me/requests[/{id}]` | employee page and requests | employee |
+| GET | `/api/me`, POST/DELETE `/api/me/requests[/{id}]`, `/api/me/absences[/{id}]` | employee page, requests and vacation/trip period requests | employee |
 | GET | `/api/schedule?month=YYYY-MM` | calendar, loads, log | teamlead/admin |
 | GET | `/api/candidates?date=` | availability, loads, probabilities | teamlead/admin |
 | POST | `/api/duties`, PATCH/DELETE `/api/duties/{id}` | manual shift | teamlead/admin |
@@ -403,14 +427,16 @@ tests/          pytest; test_i18n.mjs — dictionary checks in Node
 | GET/POST/DELETE | `/api/absences` | absences | teamlead/admin |
 | GET/POST/DELETE | `/api/holidays`, POST `/api/holidays/seed` | holidays | teamlead/admin |
 | GET | `/api/stats` | statistics and dashboards (KPI, balance, months, coverage, weekend share, weekday matrix, draw audit) | teamlead/admin |
-| GET | `/api/export?month=`, `/api/export/schedule.xlsx?month=` | CSV and XLSX schedule for printing | teamlead/admin |
+| GET | `/api/export?month=`, `/api/export/schedule.xlsx?month=`, `/api/export/schedule-bw.xlsx?month=` | CSV, XLSX schedule for printing and its B/W variant with a legend | teamlead/admin |
 | GET/PUT | `/api/settings` | rules and notifications | teamlead/admin* |
 | GET | `/api/requests`, PATCH/DELETE `/api/requests/{id}` | requests and decisions | teamlead/admin |
+| PATCH/DELETE | `/api/absence-requests/{id}` | approve/reject vacation and business-trip requests | teamlead/admin |
 | GET | `/api/coverage` | uncovered days, logs | teamlead/admin |
 | POST/DELETE | `/api/coverage/{day}/dismiss`, `/api/coverage/{day}` | dismiss/return a day | teamlead/admin |
 | POST | `/api/coverage/{day}/assign` | assign over the rules | teamlead/admin |
 | GET/POST/PATCH/DELETE | `/api/users[/{id}]` | accounts | admin |
 | GET/POST | `/api/notifications[/test|/retry]` | log and channel checks | admin |
+| GET | `/api/backup` | database backup (consistent SQLite snapshot) | admin |
 | GET | `/login`, `/me`, `/` | login, self-service, SPA pages | — |
 
 \* notification settings and reading the send log — administrator only.

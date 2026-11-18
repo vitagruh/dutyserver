@@ -53,12 +53,14 @@ test('dynamic phrases are translated without touching names', () => {
   assert.equal(i18n.translate('сегодня 18.11.2026', 'en'), 'today 18.11.2026');
   assert.equal(
     i18n.translate(
-      'Заявки подаются на 90 дней вперёд и не более 10 дней в месяц. Планировщик согласует или отклонит их; ' +
-        'при согласовании дни «не могу» исключаются из распределения. Отозвать можно только заявку, ожидающую согласования.',
+      'Заявки «не могу» и «предпочитаю» подаются на 90 дней вперёд и не более 10 дней в месяц; ' +
+        'отпуск и командировка — периодом «с … по …». Планировщик согласует или отклонит их; ' +
+        'при согласовании дни исключаются из распределения. Отозвать можно только заявку, ожидающую согласования.',
       'en',
     ),
-    'Requests can be submitted up to 90 days ahead and no more than 10 days per month. ' +
-      'The planner approves or declines them; once approved, “can’t” days are excluded from scheduling. ' +
+    '“Can’t” and “prefer not to” requests can be submitted up to 90 days ahead and no more than 10 days per month; ' +
+      'vacation and business trips are requested as a period “from … to …”. ' +
+      'The planner approves or declines them; once approved, the days are excluded from scheduling. ' +
       'Only a request awaiting approval can be withdrawn.',
   );
 });

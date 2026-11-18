@@ -939,6 +939,8 @@ input:disabled { background: var(--bg-2); color: var(--muted); }
 .pill--planned { background: var(--info-soft); color: var(--info); }
 .pill--missed, .pill--danger, .pill--unavailable { background: var(--danger-soft); color: var(--danger); }
 .pill--preferred { background: var(--info-soft); color: var(--info); }
+.pill--vacation { background: var(--info-soft); color: var(--info); }
+.pill--trip { background: var(--accent-soft); color: var(--accent-2); }
 .pill--coef { background: var(--accent-soft); color: var(--accent-2); font-variant-numeric: tabular-nums; }
 .pill--prob { background: var(--info-soft); color: var(--info); font-variant-numeric: tabular-nums; }
 .pill--role-admin { background: var(--info-soft); color: var(--info); }
@@ -1448,6 +1450,7 @@ input:disabled { background: var(--bg-2); color: var(--muted); }
 .my-calendar .day--disabled:hover { background: var(--surface); }
 
 .my-kind { display: grid; gap: 8px; }
+.my-range { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
 .my-kind__option {
   display: flex;
   gap: 9px;

@@ -5,7 +5,16 @@
   const MONTHS_GEN = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
   const WD = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
-  const state = { data: null, month: '', selected: new Set(), kind: 'unavailable', reason: '' };
+  const state = { data: null, month: '', selected: new Set(), kind: 'unavailable', reason: '', from: '', to: '' };
+
+  const ABSENCE_KINDS = new Set(['vacation', 'trip']);
+  const ABS_SHORT = { vacation: 'отпуск', trip: 'командировка' };
+  const KIND_OPTIONS = [
+    ['unavailable', 'Не могу дежурить', 'После согласования дни исключаются из графика.'],
+    ['preferred', 'Предпочитаю не дежурить', 'Мягкая просьба: по возможности выберут другого.'],
+    ['vacation', 'Отпуск', 'Заявка на период «с … по …»: после согласования дни исключаются из графика.'],
+    ['trip', 'Командировка', 'Заявка на период «с … по …»: после согласования дни исключаются из графика.'],
+  ];
 
   const el = (id) => document.getElementById(id);
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -104,19 +113,24 @@
     location.href = '/login';
   }
 
+  function eachDate(from, to, fn) {
+    let cursor = parseISO(from);
+    const finish = parseISO(to);
+    let guard = 0;
+    while (cursor <= finish && guard < 800) {
+      fn(isoOf(cursor));
+      cursor = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1);
+      guard += 1;
+    }
+  }
+
   function requestsByDate() {
     const map = new Map();
     for (const request of state.data.requests) {
-      let cursor = parseISO(request.dateFrom);
-      const finish = parseISO(request.dateTo);
-      let guard = 0;
-      while (cursor <= finish && guard < 400) {
-        const iso = isoOf(cursor);
+      eachDate(request.dateFrom, request.dateTo, (iso) => {
         if (!map.has(iso)) map.set(iso, []);
         map.get(iso).push(request);
-        cursor = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1);
-        guard += 1;
-      }
+      });
     }
     return map;
   }
@@ -130,8 +144,29 @@
     const duties = new Map(data.duties.map((duty) => [duty.date, duty]));
     const holidays = new Map(data.holidays.map((holiday) => [holiday.date, holiday.name]));
     const requests = requestsByDate();
-    const pending = data.requests.filter((item) => item.status === 'pending').length;
-    const approved = data.requests.filter((item) => item.status === 'approved').length;
+    const absenceRequests = data.absenceRequests || [];
+    const allRequests = [...data.requests, ...absenceRequests];
+    const pending = allRequests.filter((item) => item.status === 'pending').length;
+    const approved = allRequests.filter((item) => item.status === 'approved').length;
+    const absencesByDay = new Map();
+    for (const absence of data.absences || []) {
+      eachDate(absence.dateFrom, absence.dateTo, (iso) => {
+        if (!absencesByDay.has(iso)) absencesByDay.set(iso, []);
+        absencesByDay.get(iso).push(absence);
+      });
+    }
+    const absencePendingByDay = new Map();
+    for (const request of absenceRequests) {
+      if (request.status !== 'pending') continue;
+      eachDate(request.dateFrom, request.dateTo, (iso) => {
+        if (!absencePendingByDay.has(iso)) absencePendingByDay.set(iso, []);
+        absencePendingByDay.get(iso).push(request);
+      });
+    }
+    const absenceMode = ABSENCE_KINDS.has(state.kind);
+    const rangeDays = absenceMode && state.from && state.to && state.to >= state.from
+      ? Math.round((parseISO(state.to) - parseISO(state.from)) / 86400000) + 1
+      : 0;
 
     document.title = `${person.name} — мои дежурства`;
     el('unitName').textContent = data.unitName;
@@ -156,7 +191,8 @@
       if (holiday) classes.push('day--holiday');
       if (iso === today) classes.push('day--today');
       if (disabled && inMonth) classes.push('day--disabled');
-      if (state.selected.has(iso)) classes.push('day--selected');
+      const inRange = absenceMode && state.from && iso >= state.from && iso <= (state.to || state.from);
+      if (state.selected.has(iso) || inRange) classes.push('day--selected');
 
       const chips = [];
       const duty = duties.get(iso);
@@ -173,7 +209,13 @@
           chips.push('<span class="mini mini--req">заявка · не могу</span>');
         }
       }
-      if (state.selected.has(iso)) chips.push('<span class="mini mini--duty">выбрано</span>');
+      for (const absence of absencesByDay.get(iso) || []) {
+        chips.push(`<span class="mini mini--abs">${ABS_SHORT[absence.kind] || 'отсутствие'}</span>`);
+      }
+      for (const request of absencePendingByDay.get(iso) || []) {
+        chips.push(`<span class="mini mini--req">заявка · ${ABS_SHORT[request.kind] || 'отсутствие'}</span>`);
+      }
+      if (state.selected.has(iso) || inRange) chips.push('<span class="mini mini--duty">выбрано</span>');
 
       cells.push(`
         <button type="button" class="${classes.join(' ')}" data-day="${iso}" ${disabled ? 'disabled' : ''}>
@@ -190,19 +232,21 @@
     const canPrev = state.month > today.slice(0, 7);
     const canNext = state.month < horizonTo.slice(0, 7);
     const selectedDays = [...state.selected].sort();
-    const requestRows = [...data.requests]
+    const requestRows = [...allRequests]
       .sort((a, b) => b.dateFrom.localeCompare(a.dateFrom))
       .map((request) => `
         <div class="my-request">
           <div>
             <div>
               <b>${fmtShort(request.dateFrom)}${request.dateFrom !== request.dateTo ? ` – ${fmtLong(request.dateTo)}` : ''}</b>
-              <span class="pill pill--${request.kind === 'unavailable' ? 'unavailable' : 'preferred'}">${esc(request.kindLabel)}</span>
+              <span class="pill pill--${request.kind}">${esc(request.kindLabel)}</span>
               <span class="pill pill--${request.status === 'approved' ? 'used' : request.status === 'declined' ? 'declined' : 'pending'}">${esc(request.statusLabel)}</span>
             </div>
             <div class="my-request__meta">${request.days} ${plural(request.days, 'день', 'дня', 'дней')}${request.reason ? ` · ${esc(request.reason)}` : ''}</div>
           </div>
-          ${request.status === 'pending' ? `<button class="btn btn--sm btn--ghost" type="button" data-cancel="${request.id}">Отозвать</button>` : ''}
+          ${request.status === 'pending'
+            ? `<button class="btn btn--sm btn--ghost" type="button" ${request.origin === 'absence' ? `data-cancel-abs="${request.id}"` : `data-cancel="${request.id}"`}>Отозвать</button>`
+            : ''}
         </div>
       `).join('');
 
@@ -234,8 +278,8 @@
         </div>
         <div class="kpi">
           <span class="kpi__label">Выбрано сейчас</span>
-          <span class="kpi__value">${selectedDays.length}</span>
-          <span class="kpi__sub">${plural(selectedDays.length, 'день', 'дня', 'дней')} в новой заявке</span>
+          <span class="kpi__value">${absenceMode ? rangeDays : selectedDays.length}</span>
+          <span class="kpi__sub">${plural(absenceMode ? rangeDays : selectedDays.length, 'день', 'дня', 'дней')} в новой заявке</span>
         </div>
       </div>
 
@@ -247,7 +291,7 @@
               <h3>${monthLabel(state.month)}</h3>
               <button class="icon-btn icon-btn--lg" type="button" data-shift="1" ${canNext ? '' : 'disabled'} aria-label="Следующий месяц">›</button>
             </div>
-            <span class="small muted">нажмите на день, чтобы выбрать или снять</span>
+            <span class="small muted">${absenceMode ? 'нажмите на день — он станет началом или концом периода' : 'нажмите на день, чтобы выбрать или снять'}</span>
           </div>
           <div class="calendar-wrap" style="box-shadow:none;border:0;padding:0">
             <div class="calendar my-calendar" style="min-width:0">
@@ -259,6 +303,7 @@
             <span><i style="background:var(--accent-soft);border:1px solid var(--accent-line)"></i>дежурство</span>
             <span><i style="background:#fff1dc"></i>заявка ожидает</span>
             <span><i style="background:var(--danger-soft)"></i>«не могу» согласовано</span>
+            <span><i style="background:var(--danger-soft)"></i>отпуск / командировка</span>
             <span><i style="background:var(--info-soft)"></i>просьба не назначать</span>
           </div>
         </section>
@@ -268,27 +313,41 @@
             <div class="panel__head"><h3>Новая заявка</h3></div>
             <form id="requestForm" class="form">
               <div class="my-kind">
-                <label class="my-kind__option ${state.kind === 'unavailable' ? 'is-active' : ''}">
-                  <input type="radio" name="kind" value="unavailable" ${state.kind === 'unavailable' ? 'checked' : ''}>
-                  <span><b>Не могу дежурить</b><span>После согласования дни исключаются из графика.</span></span>
-                </label>
-                <label class="my-kind__option ${state.kind === 'preferred' ? 'is-active' : ''}">
-                  <input type="radio" name="kind" value="preferred" ${state.kind === 'preferred' ? 'checked' : ''}>
-                  <span><b>Предпочитаю не дежурить</b><span>Мягкая просьба: по возможности выберут другого.</span></span>
-                </label>
+                ${KIND_OPTIONS.map(([value, title, hint]) => `
+                  <label class="my-kind__option ${state.kind === value ? 'is-active' : ''}">
+                    <input type="radio" name="kind" value="${value}" ${state.kind === value ? 'checked' : ''}>
+                    <span><b>${title}</b><span>${hint}</span></span>
+                  </label>
+                `).join('')}
               </div>
+              ${absenceMode ? `
+                <div class="my-range">
+                  <div class="field">
+                    <label for="absenceFrom">С</label>
+                    <input id="absenceFrom" type="date" name="date_from" min="${today}" max="${horizonTo}" value="${state.from}">
+                  </div>
+                  <div class="field">
+                    <label for="absenceTo">По</label>
+                    <input id="absenceTo" type="date" name="date_to" min="${today}" max="${horizonTo}" value="${state.to}">
+                  </div>
+                </div>
+              ` : ''}
               <div class="field" style="margin-top:12px">
                 <label for="requestReason">Причина (необязательно)</label>
                 <input id="requestReason" type="text" name="reason" maxlength="200" value="${esc(state.reason)}" placeholder="например, учёба, семейные обстоятельства">
               </div>
               <div class="small muted" style="margin-top:8px">
-                ${selectedDays.length
-                  ? `Выбрано: ${selectedDays.map(fmtShort).join(', ')}`
-                  : 'Дни не выбраны. Отметьте их в календаре.'}
+                ${absenceMode
+                  ? (rangeDays
+                    ? `Период: ${fmtLong(state.from)} — ${fmtLong(state.to)} · ${plural(rangeDays, 'день', 'дня', 'дней')}`
+                    : 'Выберите даты начала и окончания.')
+                  : (selectedDays.length
+                    ? `Выбрано: ${selectedDays.map(fmtShort).join(', ')}`
+                    : 'Дни не выбраны. Отметьте их в календаре.')}
               </div>
               <div class="btn-row" style="margin-top:12px">
-                <button class="btn btn--primary" type="submit" ${selectedDays.length ? '' : 'disabled'}>Отправить на согласование</button>
-                <button class="btn btn--ghost" type="button" id="clearSelection" ${selectedDays.length ? '' : 'disabled'}>Очистить</button>
+                <button class="btn btn--primary" type="submit" ${(absenceMode ? rangeDays : selectedDays.length) ? '' : 'disabled'}>${absenceMode ? 'Отправить заявку на отсутствие' : 'Отправить на согласование'}</button>
+                <button class="btn btn--ghost" type="button" id="clearSelection" ${(absenceMode ? (state.from || state.to) : selectedDays.length) ? '' : 'disabled'}>Очистить</button>
               </div>
             </form>
           </section>
@@ -296,7 +355,7 @@
           <section class="panel" style="margin-top:0">
             <div class="panel__head">
               <h3>Мои заявки</h3>
-              <span class="small muted">${data.requests.length}</span>
+              <span class="small muted">${allRequests.length}</span>
             </div>
             ${requestRows || '<div class="empty-state" style="padding:20px">Заявок пока нет.</div>'}
             <div class="small muted" style="margin-top:10px">
@@ -330,8 +389,9 @@
       </div>
       <div class="note-panel" style="margin-top:16px">
         <strong>Как это работает.</strong>
-        Заявки подаются на ${data.horizonDays} дней вперёд и не более ${data.monthLimit || '∞'} дней в месяц.
-        Планировщик согласует или отклонит их; при согласовании дни «не могу» исключаются из распределения.
+        Заявки «не могу» и «предпочитаю» подаются на ${data.horizonDays} дней вперёд и не более
+        ${data.monthLimit || '∞'} дней в месяц; отпуск и командировка — периодом «с … по …».
+        Планировщик согласует или отклонит их; при согласовании дни исключаются из распределения.
         Отозвать можно только заявку, ожидающую согласования.
       </div>
     `;
@@ -346,6 +406,16 @@
         if (button.disabled) return;
         const iso = button.dataset.day;
         state.reason = el('requestReason')?.value || '';
+        if (ABSENCE_KINDS.has(state.kind)) {
+          if (!state.from || state.to || iso < state.from) {
+            state.from = iso;
+            state.to = iso;
+          } else {
+            state.to = iso;
+          }
+          render();
+          return;
+        }
         if (state.selected.has(iso)) state.selected.delete(iso);
         else state.selected.add(iso);
         render();
@@ -364,14 +434,46 @@
         render();
       });
     });
+    ['absenceFrom', 'absenceTo'].forEach((id) => {
+      const input = el(id);
+      if (!input) return;
+      input.addEventListener('change', () => {
+        state.reason = el('requestReason')?.value || '';
+        if (id === 'absenceFrom') state.from = input.value;
+        else state.to = input.value;
+        render();
+      });
+    });
     const clear = el('clearSelection');
-    if (clear) clear.addEventListener('click', () => { state.selected.clear(); render(); });
+    if (clear) clear.addEventListener('click', () => {
+      state.selected.clear();
+      state.from = '';
+      state.to = '';
+      render();
+    });
 
     const form = el('requestForm');
     if (form) {
       form.addEventListener('submit', act(async (event) => {
         event.preventDefault();
         const reason = form.querySelector('[name="reason"]').value.trim();
+        if (ABSENCE_KINDS.has(state.kind)) {
+          const from = el('absenceFrom')?.value || state.from;
+          const to = el('absenceTo')?.value || state.to;
+          if (!from || !to) { toast('Выберите даты начала и окончания.', 'error'); return; }
+          if (to < from) { toast('Дата окончания раньше даты начала', 'error'); return; }
+          const result = await api('/api/me/absences', {
+            method: 'POST',
+            body: { date_from: from, date_to: to, kind: state.kind, reason },
+          });
+          state.from = '';
+          state.to = '';
+          state.reason = '';
+          const total = result.request.days;
+          toast(`Заявка отправлена на согласование: ${total} ${plural(total, 'день', 'дня', 'дней')}`);
+          await load();
+          return;
+        }
         const dates = [...state.selected].sort();
         if (!dates.length) { toast('Выберите дни в календаре', 'error'); return; }
         const result = await api('/api/me/requests', {
@@ -406,6 +508,14 @@
       button.addEventListener('click', act(async () => {
         if (!confirm('Отозвать заявку?')) return;
         await api(`/api/me/requests/${button.dataset.cancel}`, { method: 'DELETE' });
+        toast('Заявка отозвана');
+        await load();
+      }));
+    });
+    view.querySelectorAll('[data-cancel-abs]').forEach((button) => {
+      button.addEventListener('click', act(async () => {
+        if (!confirm('Отозвать заявку?')) return;
+        await api(`/api/me/absences/${button.dataset.cancelAbs}`, { method: 'DELETE' });
         toast('Заявка отозвана');
         await load();
       }));

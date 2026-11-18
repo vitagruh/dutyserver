@@ -385,6 +385,7 @@
           <button class="btn btn--primary" type="button" id="rouletteOpenBtn">Рулетка</button>
           <button class="btn btn--ghost" type="button" id="autoPlanBtn">Автораспределение</button>
           <a class="btn btn--ghost" href="/api/export/schedule.xlsx?month=${encodeURIComponent(S.month)}">Excel для печати</a>
+          <a class="btn btn--ghost" href="/api/export/schedule-bw.xlsx?month=${encodeURIComponent(S.month)}">ЧБ для печати</a>
           <a class="btn btn--ghost" href="/api/export?month=${encodeURIComponent(S.month)}">Экспорт CSV</a>
         </div>
       </div>
@@ -839,6 +840,7 @@
         <div>
           <h2 class="page-title">Заявки сотрудников</h2>
           <p class="page-sub">Сотрудник отмечает дни в личном кабинете. «Не могу» после согласования жёстко исключает из назначений; «предпочитаю» — мягкий приоритет, автораспределение обходит его, если есть альтернатива.</p>
+          <p class="page-sub">Отпуск и командировку сотрудник подаёт периодом «с … по …»: после согласования создаётся отсутствие.</p>
         </div>
         <div class="head-actions">
           ${isAdmin() ? '<button class="btn btn--ghost" type="button" id="requestsToLinks">Учётные записи</button>' : ''}
@@ -899,12 +901,12 @@
                     : `${fmtLong(item.dateFrom)} — ${fmtLong(item.dateTo)}`;
                   const actions = [];
                   if (item.status !== 'approved') {
-                    actions.push(`<button class="btn btn--sm btn--primary" type="button" data-req-decide="${item.id}" data-status="approved">Согласовать</button>`);
+                    actions.push(`<button class="btn btn--sm btn--primary" type="button" data-req-decide="${item.id}" data-req-origin="${esc(item.origin)}" data-status="approved">Согласовать</button>`);
                   }
                   if (item.status !== 'declined') {
-                    actions.push(`<button class="btn btn--sm btn--ghost" type="button" data-req-decide="${item.id}" data-status="declined">${item.status === 'approved' ? 'Отменить' : 'Отклонить'}</button>`);
+                    actions.push(`<button class="btn btn--sm btn--ghost" type="button" data-req-decide="${item.id}" data-req-origin="${esc(item.origin)}" data-was-approved="${item.status === 'approved' ? '1' : '0'}" data-status="declined">${item.status === 'approved' ? 'Отменить' : 'Отклонить'}</button>`);
                   }
-                  actions.push(`<button class="btn btn--sm btn--danger" type="button" data-req-del="${item.id}">Удалить</button>`);
+                  actions.push(`<button class="btn btn--sm btn--danger" type="button" data-req-del="${item.id}" data-req-origin="${esc(item.origin)}">Удалить</button>`);
                   return `
                     <tr>
                       <td>${personCell({ name: item.personName, note: '' })}</td>
@@ -931,10 +933,11 @@
 
       <div class="note-panel">
         <strong>Как это работает.</strong>
-        Заявка «не могу» после согласования исключает сотрудника из назначений на выбранные дни —
+        <span>Заявка «не могу» после согласования исключает сотрудника из назначений на выбранные дни —
         как отпуск. Заявка «предпочитаю» не запрещает назначение, но автораспределение выбирает
         других сотрудников, если это не увеличивает нагрузку. Согласовать заявку нельзя, пока на эти
-        дни у сотрудника есть действующее дежурство: сначала переназначьте его.
+        дни у сотрудника есть действующее дежурство: сначала переназначьте его.</span>
+        <span>Отпуск и командировка подаются периодом и после согласования становятся отсутствием.</span>
       </div>
     `;
 
@@ -949,8 +952,18 @@
     $$('[data-req-decide]').forEach((button) => {
       button.addEventListener('click', act(async () => {
         const status = button.dataset.status;
-        if (status === 'declined' && !confirm('Отклонить заявку сотрудника?')) return;
-        await api(`/api/requests/${button.dataset.reqDecide}`, {
+        if (status === 'declined') {
+          const message = button.dataset.wasApproved === '1'
+            ? (button.dataset.reqOrigin === 'absence'
+              ? 'Отменить заявку и удалить оформленное отсутствие?'
+              : 'Отменить согласованную заявку?')
+            : 'Отклонить заявку сотрудника?';
+          if (!confirm(message)) return;
+        }
+        const url = button.dataset.reqOrigin === 'absence'
+          ? `/api/absence-requests/${button.dataset.reqDecide}`
+          : `/api/requests/${button.dataset.reqDecide}`;
+        await api(url, {
           method: 'PATCH',
           body: { status },
         });
@@ -962,7 +975,10 @@
     $$('[data-req-del]').forEach((button) => {
       button.addEventListener('click', act(async () => {
         if (!confirm('Удалить заявку без возможности восстановления?')) return;
-        await api(`/api/requests/${button.dataset.reqDel}`, { method: 'DELETE' });
+        const url = button.dataset.reqOrigin === 'absence'
+          ? `/api/absence-requests/${button.dataset.reqDel}`
+          : `/api/requests/${button.dataset.reqDel}`;
+        await api(url, { method: 'DELETE' });
         toast('Заявка удалена');
         S.requestsData = null;
         await loadSchedule(S.month);
@@ -2182,6 +2198,17 @@
               </table>
             </div>
           ` : '<div class="empty-state" style="padding:22px">Сообщений пока не было. Уведомления ставятся в очередь при событиях заявок и покрытия.</div>'}
+        </section>
+
+        <section class="panel">
+          <div class="panel__head">
+            <h3>Резервная копия</h3>
+            <span class="small muted">SQLite</span>
+          </div>
+          <p class="small muted">Снимок базы целиком: сотрудники, график, заявки, отсутствия, настройки и учётные записи. Файл создаётся согласованно и скачивается в формате SQLite.</p>
+          <div class="btn-row">
+            <a class="btn btn--primary" href="/api/backup">Скачать копию базы</a>
+          </div>
         </section>
       ` : ''}
 

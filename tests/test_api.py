@@ -1,5 +1,6 @@
 import io
 import shutil
+import sqlite3
 import subprocess
 import zipfile
 from datetime import date, timedelta
@@ -41,6 +42,7 @@ def client():
                 "comp_choices",
                 "draws",
                 "duties",
+                "absence_requests",
                 "absences",
                 "holidays",
                 "users",
@@ -449,6 +451,160 @@ def test_approval_blocked_by_existing_duty(client: TestClient):
     assert candidates[ivanov]["reasons"] == ["в этот день уже назначено дежурство"]
 
 
+def test_employee_absence_request_for_vacation_period(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    add_person(client, "Петров")
+    add_account(client, ivanov, "ivanov")
+    employee = login_as("ivanov")
+
+    start = MONDAY
+    finish = MONDAY + timedelta(days=4)
+    created = employee.post(
+        "/api/me/absences",
+        json={
+            "date_from": start.isoformat(),
+            "date_to": finish.isoformat(),
+            "kind": "vacation",
+            "reason": "плановый отпуск",
+        },
+    )
+    assert created.status_code == 200
+    request = created.json()["request"]
+    assert request["origin"] == "absence"
+    assert request["status"] == "pending"
+    assert request["days"] == 5
+    assert request["kindLabel"] == "Отпуск"
+    request_id = request["id"]
+
+    overlapping = employee.post(
+        "/api/me/absences",
+        json={
+            "date_from": (start + timedelta(days=1)).isoformat(),
+            "date_to": (start + timedelta(days=2)).isoformat(),
+            "kind": "trip",
+        },
+    )
+    assert overlapping.status_code == 409
+
+    personal = employee.get("/api/me").json()
+    assert [item["id"] for item in personal["absenceRequests"]] == [request_id]
+    assert personal["absences"] == []
+
+    listing = client.get("/api/requests").json()
+    absence_item = next(
+        item for item in listing["requests"] if item["origin"] == "absence"
+    )
+    assert absence_item["personName"] == "Иванов"
+    assert listing["kindLabels"]["vacation"] == "Отпуск"
+    schedule = client.get("/api/schedule", params={"month": MONTH}).json()
+    assert schedule["requestSummary"]["pending"] == 1
+
+    assert employee.patch(
+        f"/api/absence-requests/{request_id}", json={"status": "approved"}
+    ).status_code == 403
+
+    approved = client.patch(
+        f"/api/absence-requests/{request_id}", json={"status": "approved"}
+    )
+    assert approved.status_code == 200
+    assert approved.json()["request"]["status"] == "approved"
+    with db.db() as conn:
+        absence = conn.execute(
+            "SELECT date_from, date_to, kind FROM absences WHERE person_id = ?",
+            (ivanov,),
+        ).fetchone()
+    assert absence is not None
+    assert (absence["date_from"], absence["date_to"]) == (
+        start.isoformat(),
+        finish.isoformat(),
+    )
+    assert absence["kind"] == "vacation"
+
+    candidates = {
+        item["person_id"]: item
+        for item in client.get(
+            "/api/candidates", params={"date": start.isoformat()}
+        ).json()["candidates"]
+    }
+    assert candidates[ivanov]["eligible"] is False
+    assert any("отсутствие" in reason for reason in candidates[ivanov]["reasons"])
+    personal = employee.get("/api/me").json()
+    assert personal["absences"][0]["kindLabel"] == "Отпуск"
+
+    declined = client.patch(
+        f"/api/absence-requests/{request_id}", json={"status": "declined"}
+    )
+    assert declined.status_code == 200
+    with db.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM absences WHERE person_id = ?", (ivanov,)
+        ).fetchone()[0] == 0
+    candidates = {
+        item["person_id"]: item
+        for item in client.get(
+            "/api/candidates", params={"date": start.isoformat()}
+        ).json()["candidates"]
+    }
+    assert candidates[ivanov]["eligible"] is True
+
+    duty = client.post(
+        "/api/duties", json={"date": start.isoformat(), "person_id": ivanov}
+    )
+    assert duty.status_code == 200
+    duty_id = duty.json()["duty"]["id"]
+    conflict = employee.post(
+        "/api/me/absences",
+        json={
+            "date_from": start.isoformat(),
+            "date_to": finish.isoformat(),
+            "kind": "trip",
+        },
+    )
+    assert conflict.status_code == 200
+    conflict_id = conflict.json()["request"]["id"]
+    blocked = client.patch(
+        f"/api/absence-requests/{conflict_id}",
+        json={"status": "approved"},
+    )
+    assert blocked.status_code == 409
+    assert "дежурство" in blocked.json()["detail"]
+
+    assert employee.delete(f"/api/me/absences/{conflict_id}").status_code == 200
+    assert employee.delete(f"/api/me/absences/{conflict_id}").status_code == 404
+
+    assert employee.post(
+        "/api/me/absences",
+        json={
+            "date_from": (date.today() + timedelta(days=120)).isoformat(),
+            "date_to": (date.today() + timedelta(days=121)).isoformat(),
+        },
+    ).status_code == 400
+    assert employee.post(
+        "/api/me/absences",
+        json={"date_from": finish.isoformat(), "date_to": start.isoformat()},
+    ).status_code == 400
+
+    assert client.delete(f"/api/duties/{duty_id}").status_code == 200
+    second = employee.post(
+        "/api/me/absences",
+        json={
+            "date_from": start.isoformat(),
+            "date_to": finish.isoformat(),
+            "kind": "trip",
+        },
+    )
+    assert second.status_code == 200
+    second_id = second.json()["request"]["id"]
+    assert client.patch(
+        f"/api/absence-requests/{second_id}", json={"status": "approved"}
+    ).status_code == 200
+    assert client.delete(f"/api/absence-requests/{second_id}").status_code == 200
+    with db.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM absences WHERE person_id = ?", (ivanov,)
+        ).fetchone()[0] == 0
+
+
 def test_auto_plan_respects_requests(client: TestClient):
     ivanov = add_person(client, "Иванов")
     petrov = add_person(client, "Петров")
@@ -739,6 +895,111 @@ def test_export_schedule_xlsx_for_print(client: TestClient):
     assert client.get(
         "/api/export/schedule.xlsx", params={"month": "2026-13"}
     ).status_code == 400
+
+
+def test_export_schedule_bw_xlsx_with_legend_and_absences(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    petrov = add_person(client, "Петров")
+    sidorov = add_person(client, "Сидоров")
+    assert client.post(
+        "/api/duties", json={"date": MONDAY.isoformat(), "person_id": ivanov}
+    ).status_code == 200
+    absence_period = {
+        "date_from": MONDAY.isoformat(),
+        "date_to": (MONDAY + timedelta(days=1)).isoformat(),
+    }
+    assert client.post(
+        "/api/absences",
+        json={"person_id": petrov, "kind": "vacation", **absence_period},
+    ).status_code == 200
+    assert client.post(
+        "/api/absences",
+        json={"person_id": sidorov, "kind": "trip", **absence_period},
+    ).status_code == 200
+    assert client.post(
+        "/api/holidays",
+        json={"date": MONDAY.isoformat(), "name": "Тестовый праздник"},
+    ).status_code == 200
+
+    response = client.get(
+        "/api/export/schedule-bw.xlsx", params={"month": MONTH}
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    assert "duty_schedule_bw_" in response.headers["content-disposition"]
+    assert response.content[:2] == b"PK"
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        styles = archive.read("xl/styles.xml").decode("utf-8")
+        assert 'patternType="lightUp"' in styles
+        assert "FFE7E7E7" in styles
+        assert "FFD9D9D9" in styles
+        matrix = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "ГРАФИК СУТОЧНЫХ ДЕЖУРСТВ — ЧБ ДЛЯ ПЕЧАТИ" in matrix
+        assert "Условные обозначения" in matrix
+        assert "Д — дежурство" in matrix
+        assert "О — отпуск" in matrix
+        assert "К — командировка" in matrix
+        assert "Б — болезнь" in matrix
+        assert "серая заливка" in matrix
+        assert "Иванов" in matrix
+        assert "Петров" in matrix
+        assert "Сидоров" in matrix
+        assert ">Д</t>" in matrix
+        assert ">О</t>" in matrix
+        assert ">К</t>" in matrix
+        assert 's="23"' in matrix
+        assert 's="25"' in matrix
+        assert 's="26"' in matrix
+        assert 'xSplit="1"' in matrix
+        assert 'scale="62"' in matrix
+        listing = archive.read("xl/worksheets/sheet2.xml").decode("utf-8")
+        assert "СПИСОК ДЕЖУРСТВ И ОТСУТСТВИЙ — ЧБ ДЛЯ ПЕЧАТИ" in listing
+        assert "Тестовый праздник" in listing
+        assert "Выходной" in listing
+        assert "Петров — отпуск" in listing
+        assert "Сидоров — командировка" in listing
+        assert 'orientation="landscape"' in listing
+        assert 'fitToWidth="1"' in listing
+        workbook = archive.read("xl/workbook.xml").decode("utf-8")
+        assert "ФИО-Дата ЧБ" in workbook
+        assert "Список ЧБ" in workbook
+        assert workbook.count("_xlnm.Print_Titles") == 2
+
+    assert client.get(
+        "/api/export/schedule-bw.xlsx", params={"month": "2026-13"}
+    ).status_code == 400
+
+
+def test_backup_download_admin_only(client: TestClient, tmp_path):
+    ivanov = add_person(client, "Иванов")
+
+    response = client.get("/api/backup")
+    assert response.status_code == 200
+    assert response.content.startswith(b"SQLite format 3\x00")
+    assert response.content[18:20] == b"\x01\x01"
+    assert "duty_backup_" in response.headers["content-disposition"]
+    assert response.headers["cache-control"] == "no-store"
+
+    backup_path = tmp_path / "duty_backup.db"
+    backup_path.write_bytes(response.content)
+    copy = sqlite3.connect(backup_path)
+    try:
+        assert copy.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        assert copy.execute("SELECT name FROM people").fetchall() == [("Иванов",)]
+    finally:
+        copy.close()
+
+    add_account(client, ivanov, "ivanov")
+    employee = login_as("ivanov")
+    assert employee.get("/api/backup").status_code == 403
+
+    petrov = add_person(client, "Петров")
+    add_account(client, petrov, "petrov", role="teamlead")
+    teamlead = login_as("petrov")
+    assert teamlead.get("/api/backup").status_code == 403
 
 
 def test_extended_stats_weekdays_months_and_totals(client: TestClient):

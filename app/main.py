@@ -8,10 +8,11 @@ import random
 import secrets
 import sqlite3
 import statistics
+import tempfile
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -55,6 +56,12 @@ ABSENCE_KIND_LABELS = {
     "trip": "Командировка",
     "other": "Другое",
 }
+BW_ABSENCE_SYMBOLS = {
+    "vacation": "О",
+    "trip": "К",
+    "sick": "Б",
+    "other": "Н",
+}
 COMP_STATUS_LABELS = {
     "pending": "Не оформлен",
     "scheduled": "Запланирован",
@@ -64,6 +71,10 @@ COMP_STATUS_LABELS = {
 REQUEST_KIND_LABELS = {
     "unavailable": "Не может дежурить",
     "preferred": "Предпочитает не дежурить",
+}
+ABSENCE_REQUEST_KIND_LABELS = {
+    "vacation": "Отпуск",
+    "trip": "Командировка",
 }
 REQUEST_STATUS_LABELS = {
     "pending": "Ожидает согласования",
@@ -204,6 +215,13 @@ class HolidaySeedIn(BaseModel):
 class MyRequestIn(BaseModel):
     dates: list[str]
     kind: str = "unavailable"
+    reason: str = ""
+
+
+class MyAbsenceIn(BaseModel):
+    date_from: str
+    date_to: str
+    kind: str = "vacation"
     reason: str = ""
 
 
@@ -418,9 +436,21 @@ def load_availability(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def load_absence_requests(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT r.*, p.name AS person_name, p.active AS person_active "
+            "FROM absence_requests r JOIN people p ON p.id = r.person_id "
+            "ORDER BY r.date_from, p.name COLLATE NOCASE"
+        )
+    ]
+
+
 def request_out(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
+        "origin": "availability",
         "personId": int(row["person_id"]),
         "personName": row.get("person_name", "—"),
         "dateFrom": row["date_from"],
@@ -428,6 +458,25 @@ def request_out(row: dict[str, Any]) -> dict[str, Any]:
         "days": (engine.as_date(row["date_to"]) - engine.as_date(row["date_from"])).days + 1,
         "kind": row["kind"],
         "kindLabel": REQUEST_KIND_LABELS.get(row["kind"], row["kind"]),
+        "reason": row["reason"],
+        "status": row["status"],
+        "statusLabel": REQUEST_STATUS_LABELS.get(row["status"], row["status"]),
+        "createdAt": row["created_at"],
+        "decidedAt": row["decided_at"],
+    }
+
+
+def absence_request_out(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "origin": "absence",
+        "personId": int(row["person_id"]),
+        "personName": row.get("person_name", "—"),
+        "dateFrom": row["date_from"],
+        "dateTo": row["date_to"],
+        "days": (engine.as_date(row["date_to"]) - engine.as_date(row["date_from"])).days + 1,
+        "kind": row["kind"],
+        "kindLabel": ABSENCE_REQUEST_KIND_LABELS.get(row["kind"], row["kind"]),
         "reason": row["reason"],
         "status": row["status"],
         "statusLabel": REQUEST_STATUS_LABELS.get(row["status"], row["status"]),
@@ -926,7 +975,11 @@ async def rbac_middleware(request: Request, call_next):
         return await call_next(request)
     if role == "employee":
         return JSONResponse({"detail": "Недостаточно прав"}, status_code=403)
-    if path.startswith("/api/users") or path.startswith("/api/notifications"):
+    if (
+        path.startswith("/api/users")
+        or path.startswith("/api/notifications")
+        or path.startswith("/api/backup")
+    ):
         if role != "admin":
             return JSONResponse(
                 {"detail": "Доступно только администратору"}, status_code=403
@@ -1227,6 +1280,9 @@ def schedule(month: str | None = None) -> dict[str, Any]:
         comp_rows = load_comp_rows(conn)
         absences = load_absences(conn)
         requests = load_availability(conn)
+        pending_absence_requests = conn.execute(
+            "SELECT COUNT(*) FROM absence_requests WHERE status = 'pending'"
+        ).fetchone()[0]
         coverage_open = len(
             coverage_gaps(conn, today(), today() + timedelta(days=30))
         )
@@ -1376,7 +1432,8 @@ def schedule(month: str | None = None) -> dict[str, Any]:
         "holidays": holidays,
         "compSummary": comp_summary,
         "requestSummary": {
-            "pending": sum(1 for row in requests if row["status"] == "pending"),
+            "pending": sum(1 for row in requests if row["status"] == "pending")
+            + int(pending_absence_requests),
             "approved": sum(1 for row in requests if row["status"] == "approved"),
         },
         "coverageSummary": {"open": coverage_open},
@@ -2270,21 +2327,24 @@ def requests_list(
     status: str | None = None, person_id: int | None = None
 ) -> dict[str, Any]:
     with db.db() as conn:
-        rows = load_availability(conn)
-    if status:
-        rows = [row for row in rows if row["status"] == status]
-    if person_id is not None:
-        rows = [row for row in rows if int(row["person_id"]) == person_id]
-    order = {"pending": 0, "approved": 1, "declined": 2}
-    rows.sort(key=lambda row: (order.get(row["status"], 9), row["date_from"]))
+        availability = load_availability(conn)
+        absence_reqs = load_absence_requests(conn)
+    items = [request_out(row) for row in availability] + [
+        absence_request_out(row) for row in absence_reqs
+    ]
     counts = {"pending": 0, "approved": 0, "declined": 0}
-    with db.db() as conn:
-        for row in load_availability(conn):
-            counts[row["status"]] = counts.get(row["status"], 0) + 1
+    for item in items:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    if status:
+        items = [item for item in items if item["status"] == status]
+    if person_id is not None:
+        items = [item for item in items if int(item["personId"]) == person_id]
+    order = {"pending": 0, "approved": 1, "declined": 2}
+    items.sort(key=lambda item: (order.get(item["status"], 9), item["dateFrom"]))
     return {
-        "requests": [request_out(row) for row in rows],
+        "requests": items,
         "counts": counts,
-        "kindLabels": REQUEST_KIND_LABELS,
+        "kindLabels": {**REQUEST_KIND_LABELS, **ABSENCE_REQUEST_KIND_LABELS},
         "statusLabels": REQUEST_STATUS_LABELS,
     }
 
@@ -2354,6 +2414,125 @@ def delete_request(request_id: int) -> dict[str, str]:
         cursor = conn.execute("DELETE FROM availability WHERE id = ?", (request_id,))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Заявка не найдена")
+    return {"status": "deleted"}
+
+
+def _absence_request_row(
+    conn: sqlite3.Connection, request_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT r.*, p.name AS person_name, p.active AS person_active "
+        "FROM absence_requests r JOIN people p ON p.id = r.person_id "
+        "WHERE r.id = ?",
+        (request_id,),
+    ).fetchone()
+
+
+@app.patch("/api/absence-requests/{request_id}")
+def decide_absence_request(
+    request_id: int, payload: RequestDecisionIn
+) -> dict[str, Any]:
+    if payload.status not in ("approved", "declined"):
+        raise HTTPException(status_code=400, detail="Некорректный статус заявки")
+    with db.db() as conn:
+        row = _absence_request_row(conn, request_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Заявка не найдена")
+        if payload.status == "approved" and row["status"] != "approved":
+            start = engine.as_date(row["date_from"])
+            finish = engine.as_date(row["date_to"])
+            conflicts = sorted(
+                duty["date"]
+                for duty in load_duties(conn)
+                if engine.is_active_duty(duty)
+                and int(duty["person_id"]) == int(row["person_id"])
+                and start <= engine.as_date(duty["date"]) <= finish
+            )
+            if conflicts:
+                pretty = ", ".join(f"{engine.as_date(d):%d.%m.%Y}" for d in conflicts)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "На эти дни у сотрудника дежурство: "
+                        f"{pretty}. Сначала переназначьте его."
+                    ),
+                )
+            overlap = conn.execute(
+                "SELECT date_from, date_to FROM absences "
+                "WHERE person_id = ? AND date_from <= ? AND date_to >= ?",
+                (row["person_id"], finish.isoformat(), start.isoformat()),
+            ).fetchone()
+            if overlap:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "На эти дни уже оформлено отсутствие "
+                        f"{engine.as_date(overlap['date_from']):%d.%m.%Y}–"
+                        f"{engine.as_date(overlap['date_to']):%d.%m.%Y}."
+                    ),
+                )
+            note = "Заявка сотрудника"
+            if row["reason"]:
+                note += f": {row['reason']}"
+            with db.transaction(conn):
+                cursor = conn.execute(
+                    "INSERT INTO absences(person_id, date_from, date_to, kind, note) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (
+                        row["person_id"],
+                        row["date_from"],
+                        row["date_to"],
+                        row["kind"],
+                        note[:200],
+                    ),
+                )
+                conn.execute(
+                    "UPDATE absence_requests SET status = 'approved', absence_id = ?, "
+                    "decided_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                    (cursor.lastrowid, request_id),
+                )
+        elif payload.status == "declined":
+            with db.transaction(conn):
+                if row["absence_id"] is not None:
+                    conn.execute(
+                        "DELETE FROM absences WHERE id = ?", (row["absence_id"],)
+                    )
+                conn.execute(
+                    "UPDATE absence_requests SET status = 'declined', absence_id = NULL, "
+                    "decided_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                    (request_id,),
+                )
+        updated = _absence_request_row(conn, request_id)
+    result = absence_request_out(dict(updated))
+    notifier.enqueue(
+        "request_decided",
+        f"Заявка {REQUEST_STATUS_LABELS[payload.status].lower()}",
+        (
+            f"Ваша заявка «{result['kindLabel']}» на {result['dateFrom']}–{result['dateTo']} "
+            f"{REQUEST_STATUS_LABELS[payload.status].lower()}."
+            + (
+                "\nДни исключены из распределения как отсутствие."
+                if payload.status == "approved"
+                else ""
+            )
+        ),
+        person_id=int(updated["person_id"]),
+    )
+    refresh_coverage_alerts()
+    return {"request": result}
+
+
+@app.delete("/api/absence-requests/{request_id}")
+def delete_absence_request(request_id: int) -> dict[str, str]:
+    with db.db() as conn:
+        row = _absence_request_row(conn, request_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Заявка не найдена")
+        with db.transaction(conn):
+            if row["absence_id"] is not None:
+                conn.execute("DELETE FROM absences WHERE id = ?", (row["absence_id"],))
+            conn.execute("DELETE FROM absence_requests WHERE id = ?", (request_id,))
+    refresh_coverage_alerts()
     return {"status": "deleted"}
 
 
@@ -2546,6 +2725,14 @@ def my_data(request: Request) -> dict[str, Any]:
             row for row in load_availability(conn)
             if int(row["person_id"]) == person_id
         ]
+        absence_reqs = [
+            row for row in load_absence_requests(conn)
+            if int(row["person_id"]) == person_id
+        ]
+        my_absences = [
+            row for row in load_absences(conn)
+            if int(row["person_id"]) == person_id
+        ]
         duties = [
             duty for duty in load_duties(conn)
             if engine.is_active_duty(duty) and int(duty["person_id"]) == person_id
@@ -2579,14 +2766,132 @@ def my_data(request: Request) -> dict[str, Any]:
         "horizonDays": horizon_days,
         "monthLimit": int(settings.get("request_month_limit", 10)),
         "requests": [request_out(row) for row in requests],
+        "absenceRequests": [absence_request_out(row) for row in absence_reqs],
+        "absences": [
+            {
+                "id": int(row["id"]),
+                "dateFrom": row["date_from"],
+                "dateTo": row["date_to"],
+                "kind": row["kind"],
+                "kindLabel": ABSENCE_KIND_LABELS.get(row["kind"], row["kind"]),
+            }
+            for row in my_absences
+        ],
         "duties": visible_duties,
         "holidays": [
             row for row in holidays
             if today().isoformat() <= row["date"] <= horizon_to.isoformat()
         ],
         "kindLabels": REQUEST_KIND_LABELS,
+        "absenceKindLabels": ABSENCE_REQUEST_KIND_LABELS,
         "statusLabels": REQUEST_STATUS_LABELS,
     }
+
+
+@app.post("/api/me/absences")
+def my_create_absence(payload: MyAbsenceIn, request: Request) -> dict[str, Any]:
+    if payload.kind not in ABSENCE_REQUEST_KIND_LABELS:
+        raise HTTPException(status_code=400, detail="Некорректный тип заявки")
+    reason = payload.reason.strip()[:200]
+    user = current_user(request)
+    with db.db() as conn:
+        settings, _ = get_rules(conn)
+        person = employee_person(conn, user)
+        if not person["active"]:
+            raise HTTPException(status_code=409, detail="Сотрудник неактивен")
+        person_id = int(person["id"])
+        horizon_days = int(settings.get("request_horizon_days", 90))
+        start = parse_day(payload.date_from, "дата начала")
+        finish = parse_day(payload.date_to, "дата окончания")
+        if finish < start:
+            raise HTTPException(status_code=400, detail="Дата окончания раньше даты начала")
+        if start < today():
+            raise HTTPException(status_code=400, detail="Нельзя отмечать прошедшие дни")
+        if finish > today() + timedelta(days=horizon_days):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Заявки принимаются не дальше чем на {horizon_days} дней вперёд",
+            )
+        if (finish - start).days > 365:
+            raise HTTPException(status_code=400, detail="Слишком длинный период отсутствия")
+        clash = conn.execute(
+            "SELECT date_from, date_to FROM absences "
+            "WHERE person_id = ? AND date_from <= ? AND date_to >= ?",
+            (person_id, finish.isoformat(), start.isoformat()),
+        ).fetchone()
+        if clash:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "На эти дни уже оформлено отсутствие "
+                    f"{engine.as_date(clash['date_from']):%d.%m.%Y}–"
+                    f"{engine.as_date(clash['date_to']):%d.%m.%Y}."
+                ),
+            )
+        clash_request = conn.execute(
+            "SELECT date_from, date_to FROM absence_requests "
+            "WHERE person_id = ? AND status <> 'declined' "
+            "AND date_from <= ? AND date_to >= ?",
+            (person_id, finish.isoformat(), start.isoformat()),
+        ).fetchone()
+        if clash_request:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "На эти даты уже есть заявка "
+                    f"{engine.as_date(clash_request['date_from']):%d.%m.%Y}–"
+                    f"{engine.as_date(clash_request['date_to']):%d.%m.%Y}."
+                ),
+            )
+        cursor = conn.execute(
+            "INSERT INTO absence_requests"
+            "(person_id, date_from, date_to, kind, reason, status) "
+            "VALUES(?, ?, ?, ?, ?, 'pending')",
+            (
+                person_id,
+                start.isoformat(),
+                finish.isoformat(),
+                payload.kind,
+                reason,
+            ),
+        )
+        row = _absence_request_row(conn, int(cursor.lastrowid))
+
+    period = (
+        f"{start:%d.%m.%Y}–{finish:%d.%m.%Y}" if start != finish else f"{start:%d.%m.%Y}"
+    )
+    notifier.enqueue(
+        "request_created",
+        f"Новая заявка: {person['name']}",
+        (
+            f"{person['name']} подал(а) заявку «{ABSENCE_REQUEST_KIND_LABELS[payload.kind]}».\n"
+            f"Период: {period}\n"
+            f"Причина: {reason or 'не указана'}\n\n"
+            "Согласуйте или отклоните заявку в разделе «Заявки»."
+        ),
+        teamlead=True,
+    )
+    return {"request": absence_request_out(dict(row))}
+
+
+@app.delete("/api/me/absences/{request_id}")
+def my_delete_absence(request_id: int, request: Request) -> dict[str, str]:
+    user = current_user(request)
+    with db.db() as conn:
+        person = employee_person(conn, user)
+        row = conn.execute(
+            "SELECT * FROM absence_requests WHERE id = ? AND person_id = ?",
+            (request_id, int(person["id"])),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Заявка не найдена")
+        if row["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Отозвать можно только заявку, ожидающую согласования",
+            )
+        conn.execute("DELETE FROM absence_requests WHERE id = ?", (request_id,))
+    return {"status": "deleted"}
 
 
 @app.post("/api/me/requests")
@@ -2852,6 +3157,7 @@ def stats() -> dict[str, Any]:
         holidays, holiday_set = load_holidays(conn)
         comp_rows = load_comp_rows(conn)
         requests = load_availability(conn)
+        absence_requests = load_absence_requests(conn)
         reviews = conn.execute("SELECT COUNT(*) FROM coverage_reviews").fetchone()[0]
         overrides = conn.execute("SELECT COUNT(*) FROM coverage_overrides").fetchone()[0]
         horizon = min(int(settings.get("request_horizon_days", 90)), 180)
@@ -3001,7 +3307,8 @@ def stats() -> dict[str, Any]:
         )
 
     request_summary = {
-        "pending": sum(1 for r in requests if r["status"] == "pending"),
+        "pending": sum(1 for r in requests if r["status"] == "pending")
+        + sum(1 for r in absence_requests if r["status"] == "pending"),
         "approved": sum(1 for r in requests if r["status"] == "approved"),
         "declined": sum(1 for r in requests if r["status"] == "declined"),
         "unavailable": sum(1 for r in requests if r["kind"] == "unavailable"),
@@ -3397,6 +3704,315 @@ def export_schedule_xlsx(
         headers={
             "Content-Disposition": (
                 f'attachment; filename="duty_schedule_{label}.xlsx"'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/export/schedule-bw.xlsx")
+def export_schedule_bw(
+    month: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> Response:
+    if date_from or date_to:
+        start = parse_day(date_from or today().isoformat(), "дата начала")
+        finish = parse_day(date_to or today().isoformat(), "дата окончания")
+        label = f"{start.isoformat()}_{finish.isoformat()}"
+    else:
+        month = month or today().strftime("%Y-%m")
+        start, next_start = month_bounds(month)
+        finish = next_start - timedelta(days=1)
+        label = month
+    if start > finish:
+        raise HTTPException(status_code=400, detail="Дата начала позже даты окончания")
+    if (finish - start).days > 366:
+        raise HTTPException(status_code=400, detail="Максимальный период — 367 дней")
+
+    with db.db() as conn:
+        settings = db.load_settings(conn)
+        people = load_people(conn)
+        holidays, holiday_set = load_holidays(conn)
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT d.date, d.status, d.source, d.note, d.person_id, p.name, "
+                "c.date AS comp_date, c.status AS comp_status "
+                "FROM duties d JOIN people p ON p.id = d.person_id "
+                "LEFT JOIN comp_choices c ON c.duty_id = d.id "
+                "WHERE d.status <> 'cancelled' AND d.date BETWEEN ? AND ? "
+                "ORDER BY d.date",
+                (start.isoformat(), finish.isoformat()),
+            )
+        ]
+        absences = load_absences(conn)
+
+    holiday_names = {row["date"]: row["name"] for row in holidays}
+    unit = settings.get("unit_name", "Дежурная служба")
+    duties_by_date = {row["date"]: row for row in rows}
+    duty_person = {row["date"]: int(row["person_id"]) for row in rows}
+    weekend_count = sum(
+        1 for row in rows
+        if engine.is_day_off(engine.as_date(row["date"]), holiday_set)
+    )
+
+    period_absences = [
+        row for row in absences
+        if engine.as_date(row["date_from"]) <= finish
+        and engine.as_date(row["date_to"]) >= start
+    ]
+    absence_by_person_day: dict[tuple[int, str], str] = {}
+    absence_by_day: dict[str, list[str]] = {}
+    for absence in period_absences:
+        person_id = int(absence["person_id"])
+        symbol = BW_ABSENCE_SYMBOLS.get(absence["kind"], "Н")
+        kind_label = ABSENCE_KIND_LABELS.get(
+            absence["kind"], absence["kind"]
+        ).lower()
+        label_text = f"{absence['person_name']} — {kind_label}"
+        cursor = engine.as_date(absence["date_from"])
+        last = engine.as_date(absence["date_to"])
+        while cursor <= last:
+            if start <= cursor <= finish:
+                day_iso = cursor.isoformat()
+                absence_by_person_day.setdefault((person_id, day_iso), symbol)
+                absence_by_day.setdefault(day_iso, []).append(label_text)
+            cursor += timedelta(days=1)
+
+    dates = []
+    cursor = start
+    while cursor <= finish:
+        dates.append(cursor)
+        cursor += timedelta(days=1)
+
+    involved = set(duty_person.values()) | {
+        int(row["person_id"]) for row in period_absences
+    }
+    matrix_people = [
+        person for person in people
+        if person["active"] or int(person["id"]) in involved
+    ]
+    matrix_people.sort(key=lambda person: person["name"].lower())
+
+    subtitle = (
+        f"{unit} · период: {start:%d.%m.%Y} — {finish:%d.%m.%Y} · "
+        f"дежурств: {len(rows)} (выходных и праздничных: {weekend_count}) · "
+        f"отсутствий: {len(period_absences)}"
+    )
+    legend_symbols = (
+        "Условные обозначения: Д — дежурство; О — отпуск; "
+        "К — командировка; Б — болезнь; Н — другое отсутствие."
+    )
+    legend_days = (
+        "Выходной день — серая заливка столбца; праздничный день — "
+        "штриховка. Названия праздников и отсутствий — в листе «Список»."
+    )
+
+    matrix: list[list[xlsx.Cell]] = [
+        [("ГРАФИК СУТОЧНЫХ ДЕЖУРСТВ — ЧБ ДЛЯ ПЕЧАТИ", xlsx.TITLE)],
+        [(subtitle, xlsx.SUBTITLE)],
+        [(legend_symbols, xlsx.SUBTITLE)],
+        [(legend_days, xlsx.SUBTITLE)],
+        [("ФИО \\ Дата", xlsx.BW_HEADER)]
+        + [
+            (
+                f"{day.day:02d}",
+                xlsx.BW_HOLIDAY_BOLD if day.isoformat() in holiday_names
+                else xlsx.BW_WEEKEND_BOLD if day.weekday() >= 5
+                else xlsx.BW_HEADER,
+            )
+            for day in dates
+        ]
+        + [("Всего", xlsx.BW_HEADER), ("Вых.", xlsx.BW_HEADER)],
+        [("День недели", xlsx.BW_HEADER)]
+        + [
+            (
+                WEEKDAY_SHORT[day.weekday()],
+                xlsx.BW_HOLIDAY if day.isoformat() in holiday_names
+                else xlsx.BW_WEEKEND if day.weekday() >= 5
+                else xlsx.BW_CENTER,
+            )
+            for day in dates
+        ]
+        + [("", xlsx.BW_HEADER), ("", xlsx.BW_HEADER)],
+    ]
+    matrix_heights = {1: 26, 2: 15, 3: 14, 4: 14, 5: 19, 6: 16}
+    for person in matrix_people:
+        person_id = int(person["id"])
+        total = 0
+        day_off_total = 0
+        matrix_row: list[xlsx.Cell] = [(person["name"], xlsx.BW_BODY)]
+        for day in dates:
+            day_iso = day.isoformat()
+            if duty_person.get(day_iso) == person_id:
+                matrix_row.append(("Д", xlsx.BW_BOLD))
+                total += 1
+                if engine.is_day_off(day, holiday_set):
+                    day_off_total += 1
+                continue
+            symbol = absence_by_person_day.get((person_id, day_iso))
+            if symbol:
+                matrix_row.append((symbol, xlsx.BW_CENTER))
+            elif day_iso in holiday_names:
+                matrix_row.append(("", xlsx.BW_HOLIDAY))
+            elif day.weekday() >= 5:
+                matrix_row.append(("", xlsx.BW_WEEKEND))
+            else:
+                matrix_row.append(("", xlsx.BW_CENTER))
+        matrix_row.extend([(total, xlsx.BW_BOLD), (day_off_total, xlsx.BW_BOLD)])
+        matrix.append(matrix_row)
+        matrix_heights[len(matrix)] = 17
+
+    last_column = xlsx.column_name(len(dates) + 2)
+    matrix_merges = [
+        f"A1:{last_column}1",
+        f"A2:{last_column}2",
+        f"A3:{last_column}3",
+        f"A4:{last_column}4",
+        "A5:A6",
+    ]
+    matrix.append([])
+    for line in (
+        "Начальник подразделения: ________________________ / ________________________ /",
+        "Составил: ________________________ / ________________________ /",
+        "«___» ________________ 20___ г.",
+    ):
+        matrix.append([(line, xlsx.BW_SIGNATURE)])
+        row_number = len(matrix)
+        matrix_merges.append(f"A{row_number}:{last_column}{row_number}")
+
+    listing: list[list[xlsx.Cell]] = [
+        [("СПИСОК ДЕЖУРСТВ И ОТСУТСТВИЙ — ЧБ ДЛЯ ПЕЧАТИ", xlsx.TITLE)],
+        [(subtitle, xlsx.SUBTITLE)],
+        [(legend_symbols, xlsx.SUBTITLE)],
+        [(legend_days, xlsx.SUBTITLE)],
+        [
+            ("№", xlsx.BW_HEADER),
+            ("Дата", xlsx.BW_HEADER),
+            ("День недели", xlsx.BW_HEADER),
+            ("Тип дня", xlsx.BW_HEADER),
+            ("Дежурный", xlsx.BW_HEADER),
+            ("Отсутствия", xlsx.BW_HEADER),
+            ("Примечание", xlsx.BW_HEADER),
+        ],
+    ]
+    listing_heights = {1: 26, 2: 15, 3: 14, 4: 14, 5: 24}
+    number = 0
+    for day in dates:
+        number += 1
+        day_iso = day.isoformat()
+        duty = duties_by_date.get(day_iso)
+        holiday = holiday_names.get(day_iso)
+        if holiday:
+            day_type = f"Праздник: {holiday}"
+            type_style = xlsx.BW_HOLIDAY
+        elif day.weekday() >= 5:
+            day_type = "Выходной"
+            type_style = xlsx.BW_WEEKEND
+        else:
+            day_type = "Рабочий"
+            type_style = xlsx.BW_CENTER
+        note = duty["note"] if duty else ""
+        if duty and duty["comp_date"]:
+            comp_day = engine.as_date(duty["comp_date"])
+            comp_text = (
+                f"Отгул: {comp_day:%d.%m.%Y} "
+                f"({COMP_STATUS_LABELS.get(duty['comp_status'], duty['comp_status'])})"
+            )
+            note = f"{note}; {comp_text}" if note else comp_text
+        listing.append(
+            [
+                (number, xlsx.BW_CENTER),
+                (f"{day:%d.%m.%Y}", xlsx.BW_CENTER),
+                (WEEKDAY_NAMES[day.weekday()], xlsx.BW_CENTER),
+                (day_type, type_style),
+                (duty["name"] if duty else "—", xlsx.BW_BOLD if duty else xlsx.BW_BODY),
+                ("; ".join(absence_by_day.get(day_iso, [])) or "—", xlsx.BW_BODY),
+                (note, xlsx.BW_BODY),
+            ]
+        )
+        listing_heights[len(listing)] = 18
+
+    listing_merges = ["A1:G1", "A2:G2", "A3:G3", "A4:G4"]
+    listing.append([])
+    for line in (
+        "Начальник подразделения: ________________________ / ________________________ /",
+        "Составил: ________________________ / ________________________ /",
+        "«___» ________________ 20___ г.",
+    ):
+        listing.append([(line, xlsx.BW_SIGNATURE)])
+        row_number = len(listing)
+        listing_merges.append(f"A{row_number}:G{row_number}")
+
+    content = xlsx.build_workbook(
+        [
+            xlsx.Sheet(
+                "ФИО-Дата ЧБ",
+                matrix,
+                widths=[26] + [4.8] * len(dates) + [7, 7],
+                merges=matrix_merges,
+                row_heights=matrix_heights,
+                freeze_rows=6,
+                freeze_cols=1,
+                print_title_rows=(5, 6),
+                print_title_column=True,
+                orientation="landscape",
+                fit_to_width=None,
+                scale=62,
+                footer=(unit, "Стр. &P из &N", f"{start:%d.%m.%Y} — {finish:%d.%m.%Y}"),
+            ),
+            xlsx.Sheet(
+                "Список ЧБ",
+                listing,
+                widths=[5, 12, 15, 24, 26, 38, 30],
+                merges=listing_merges,
+                row_heights=listing_heights,
+                freeze_rows=5,
+                print_title_rows=(5, 5),
+                orientation="landscape",
+                footer=(unit, "Стр. &P из &N", f"{start:%d.%m.%Y} — {finish:%d.%m.%Y}"),
+            ),
+        ]
+    )
+    return Response(
+        content=content,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="duty_schedule_bw_{label}.xlsx"'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/backup")
+def download_backup() -> Response:
+    source = sqlite3.connect(str(db.DB_PATH), timeout=15)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            target_path = Path(tmp) / "duty_backup.db"
+            target = sqlite3.connect(str(target_path))
+            try:
+                source.backup(target)
+                # WAL-снимок не переносится сам по себе: переводим копию
+                # в одиночный файл, чтобы её можно было открыть без .db-wal
+                target.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                target.close()
+            content = target_path.read_bytes()
+    finally:
+        source.close()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return Response(
+        content=content,
+        media_type="application/x-sqlite3",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="duty_backup_{stamp}.db"'
             ),
             "Cache-Control": "no-store",
         },
