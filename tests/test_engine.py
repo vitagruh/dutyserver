@@ -197,6 +197,7 @@ def test_weekend_entitlements_only_for_days_off():
     duties = [
         duty(1, 1, MONDAY),
         duty(2, 1, SATURDAY),
+        duty(3, 1, SATURDAY + timedelta(days=7), status="missed"),
     ]
     entitlements = engine.weekend_entitlements(duties, [], set(), rules, today=SATURDAY)
     assert len(entitlements) == 1
@@ -204,6 +205,15 @@ def test_weekend_entitlements_only_for_days_off():
     assert item["duty_id"] == 2
     assert item["status"] == "pending"
     assert item["valid_until"] == (SATURDAY + timedelta(days=60)).isoformat()
+
+
+def test_missed_weekend_duty_gives_no_comp_entitlement():
+    rules = engine.Rules()
+    duties = [duty(1, 1, SATURDAY, status="missed")]
+    entitlements = engine.weekend_entitlements(
+        duties, [], set(), rules, today=SATURDAY
+    )
+    assert entitlements == []
 
 
 def test_holiday_counts_as_day_off():

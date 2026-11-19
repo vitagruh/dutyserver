@@ -48,6 +48,22 @@ def validate_password(password: str) -> str | None:
     return None
 
 
+def hash_iterations(stored: str) -> int:
+    """Число итераций PBKDF2 в сохранённом хэше (0, если формат неизвестен)."""
+    try:
+        algorithm, iterations, *_ = stored.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return 0
+        return int(iterations)
+    except (ValueError, TypeError):
+        return 0
+
+
+def needs_rehash(stored: str) -> bool:
+    iterations = hash_iterations(stored)
+    return 0 < iterations < PBKDF2_ITERATIONS
+
+
 def _sign(payload: str, secret: str) -> str:
     digest = hmac.new(
         secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import sqlite3
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -13,6 +14,8 @@ _db_env = os.environ.get("DUTY_DB", "duty.db")
 DB_PATH = Path(_db_env).expanduser()
 if not DB_PATH.is_absolute():
     DB_PATH = (BASE_DIR / DB_PATH).resolve()
+
+_perm_warning_shown = False
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS people (
@@ -102,7 +105,8 @@ CREATE TABLE IF NOT EXISTS absences (
     date_to TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'vacation'
         CHECK (kind IN ('vacation','sick','trip','other')),
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS ix_absences_person
     ON absences(person_id, date_from, date_to);
@@ -173,6 +177,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    actor_id INTEGER,
+    actor_name TEXT,
+    action TEXT NOT NULL,
+    entity TEXT,
+    entity_id TEXT,
+    details TEXT,
+    ip TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_audit_at ON audit_log(at);
 """
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -219,11 +236,34 @@ SETTINGS_SPEC: dict[str, tuple[str, float, float]] = {
 }
 
 
+def _secure_file_permissions() -> None:
+    """Ограничивает доступ к файлу БД и её sidecar-файлам (только POSIX)."""
+    if os.name != "posix":
+        return
+    global _perm_warning_shown
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(DB_PATH) + suffix)
+        if not path.exists():
+            continue
+        try:
+            os.chmod(path, 0o600)
+        except OSError as error:
+            if not _perm_warning_shown:
+                print(
+                    f"Не удалось ограничить права на {path}: {error}. "
+                    "Проверьте каталог данных вручную.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _perm_warning_shown = True
+
+
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 15000")
+    _secure_file_permissions()
     return conn
 
 
@@ -288,6 +328,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE draws ADD COLUMN proof TEXT")
         if "proof_hash" not in draw_columns:
             conn.execute("ALTER TABLE draws ADD COLUMN proof_hash TEXT")
+        absence_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(absences)")
+        }
+        if "created_by" not in absence_columns:
+            conn.execute(
+                "ALTER TABLE absences ADD COLUMN created_by INTEGER "
+                "REFERENCES users(id) ON DELETE SET NULL"
+            )
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
@@ -316,6 +364,7 @@ def init_db() -> None:
                     "Смените его после входа.",
                     flush=True,
                 )
+    _secure_file_permissions()
 
 
 def load_settings(conn: sqlite3.Connection) -> dict[str, str]:

@@ -421,6 +421,9 @@ def weekend_entitlements(
     for duty in duties:
         if not is_active_duty(duty):
             continue
+        # Неявка не даёт права на отгул: оформить его всё равно нельзя.
+        if duty.get("status") == "missed":
+            continue
         duty_date = as_date(duty["date"])
         if not is_day_off(duty_date, holidays):
             continue

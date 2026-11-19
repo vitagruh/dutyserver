@@ -26,6 +26,14 @@ test('static labels are translated', () => {
   assert.equal(i18n.translate('ПОДТВЕРЖДЕНО', 'en'), 'VERIFIED');
   assert.equal(i18n.translate('Пруф жеребьёвки', 'en'), 'Draw proof');
   assert.equal(i18n.translate('Войти', 'en'), 'Sign in');
+  assert.equal(i18n.translate('Журнал действий', 'en'), 'Action log');
+  assert.equal(i18n.translate('Действие', 'en'), 'Action');
+  assert.equal(i18n.translate('Объект', 'en'), 'Object');
+  assert.equal(i18n.translate('Детали', 'en'), 'Details');
+  assert.equal(
+    i18n.translate('✓ Веса соответствуют правилу режима', 'en'),
+    '✓ The weights match the mode rule',
+  );
 });
 
 test('dynamic phrases are translated without touching names', () => {

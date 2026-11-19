@@ -1,15 +1,20 @@
+import base64
+import hashlib
 import io
 import shutil
 import sqlite3
 import subprocess
+import time
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app import db, security
+from app import db, proofs, security
+from app import main as main_module
 from app.main import app, reset_login_failures
 
 
@@ -34,6 +39,7 @@ def client():
     with TestClient(app) as test_client:
         with db.db() as conn:
             for table in (
+                "audit_log",
                 "notification_outbox",
                 "coverage_alerts",
                 "coverage_overrides",
@@ -1527,4 +1533,559 @@ def test_roulette_replace_respects_scheduled_comp(client: TestClient):
     )
     assert refused.status_code == 409
     assert "отгул" in refused.json()["detail"]
+
+
+def test_backup_sanitizes_secrets_and_is_verifiable(client: TestClient, tmp_path):
+    secrets_map = {
+        "session_secret": "backup-session-secret",
+        "smtp_password": "smtp-pass-1",
+        "rocketchat_webhook": "https://chat.example.by/hooks/x",
+    }
+    with db.db() as conn:
+        for key, value in secrets_map.items():
+            conn.execute("UPDATE settings SET value = ? WHERE key = ?", (value, key))
+
+    response = client.get("/api/backup")
+    assert response.status_code == 200
+    assert "duty_backup_" in response.headers["content-disposition"]
+    assert response.headers["cache-control"] == "no-store"
+
+    copy_path = tmp_path / "sanitized.db"
+    copy_path.write_bytes(response.content)
+    copy = sqlite3.connect(copy_path)
+    try:
+        assert copy.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        remaining = {
+            row[0]
+            for row in copy.execute(
+                "SELECT key FROM settings WHERE key IN "
+                "('session_secret','smtp_password','rocketchat_webhook')"
+            )
+        }
+        assert remaining == set()
+        assert copy.execute(
+            "SELECT value FROM settings WHERE key = 'unit_name'"
+        ).fetchone() is not None
+    finally:
+        copy.close()
+
+    events = client.get("/api/audit").json()["events"]
+    assert any(item["action"] == "backup_download" for item in events)
+
+
+def test_settings_mask_secrets_for_non_admins(client: TestClient):
+    with db.db() as conn:
+        conn.execute(
+            "UPDATE settings SET value = 'smtp.example.by' WHERE key = 'smtp_host'"
+        )
+        conn.execute(
+            "UPDATE settings SET value = 'lead@example.by' WHERE key = 'smtp_user'"
+        )
+        conn.execute(
+            "UPDATE settings SET value = 'duty@example.by' WHERE key = 'smtp_from'"
+        )
+        conn.execute(
+            "UPDATE settings SET value = 'https://chat.example.by/hooks/1' "
+            "WHERE key = 'rocketchat_webhook'"
+        )
+        conn.execute("UPDATE settings SET value = 'secret' WHERE key = 'smtp_password'")
+
+    admin = client.get("/api/settings").json()["settings"]
+    assert admin["smtp_host"] == "smtp.example.by"
+    assert admin["smtp_user"] == "lead@example.by"
+    assert admin["smtp_from"] == "duty@example.by"
+    assert admin["rocketchat_webhook"].startswith("https://chat.example.by")
+    assert admin["smtp_configured"] is True
+    assert admin["rocketchat_webhook_set"] is True
+    assert admin["smtp_password_set"] is True
+
+    person = add_person(client, "Тимлид")
+    add_account(client, person, "lead", role="teamlead")
+    teamlead = login_as("lead")
+    data = teamlead.get("/api/settings").json()["settings"]
+    assert data["smtp_host"] == ""
+    assert data["smtp_user"] == ""
+    assert data["smtp_from"] == ""
+    assert data["rocketchat_webhook"] == ""
+    assert data["smtp_configured"] is True
+    assert data["rocketchat_webhook_set"] is True
+    assert data["smtp_password_set"] is True
+
+    employee_person = add_person(client, "Сотрудник")
+    add_account(client, employee_person, "worker")
+    employee = login_as("worker")
+    assert employee.get("/api/settings").status_code == 403
+
+
+def test_db_file_permissions_posix(monkeypatch, tmp_path, capsys):
+    base = tmp_path / "perm.db"
+    base.write_bytes(b"")
+    (tmp_path / "perm.db-wal").write_bytes(b"")
+    (tmp_path / "perm.db-shm").write_bytes(b"")
+
+    calls: list[tuple[str, int]] = []
+    fake_os = SimpleNamespace(
+        name="posix", chmod=lambda path, mode: calls.append((str(path), mode))
+    )
+    monkeypatch.setattr(db, "os", fake_os)
+    monkeypatch.setattr(db, "DB_PATH", base)
+    monkeypatch.setattr(db, "_perm_warning_shown", False)
+
+    db._secure_file_permissions()
+    assert {mode for _, mode in calls} == {0o600}
+    assert len(calls) == 3
+
+    def denied(path, mode):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(db, "os", SimpleNamespace(name="posix", chmod=denied))
+    db._secure_file_permissions()
+    db._secure_file_permissions()
+    err = capsys.readouterr().err
+    assert err.count("Не удалось ограничить права") == 1
+
+
+def test_api_docs_require_admin(client: TestClient):
+    assert client.get("/docs").status_code == 200
+    assert client.get("/redoc").status_code == 200
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/static/app.js").status_code == 200
+
+    person = add_person(client, "Тимлид")
+    add_account(client, person, "lead", role="teamlead")
+    teamlead = login_as("lead")
+    assert teamlead.get("/docs").status_code == 403
+    assert teamlead.get("/redoc").status_code == 403
+    assert teamlead.get("/openapi.json").status_code == 403
+    assert teamlead.get("/api/schedule").status_code == 200
+
+    worker_person = add_person(client, "Сотрудник")
+    add_account(client, worker_person, "worker")
+    employee = login_as("worker")
+    assert employee.get("/docs").status_code == 403
+    assert employee.get("/openapi.json").status_code == 403
+
+
+def test_csrf_origin_check(client: TestClient):
+    payload = {"name": "CSRF"}
+    foreign = {"Origin": "http://evil.example"}
+    assert client.post("/api/people", json=payload, headers=foreign).status_code == 403
+    assert client.post("/api/people", json=payload).status_code == 200
+    assert client.post(
+        "/api/people", json=payload, headers={"Origin": "http://testserver"}
+    ).status_code == 200
+
+    assert client.put(
+        "/api/settings", json={"public_url": "https://duty.example.by"}
+    ).status_code == 200
+    assert client.post(
+        "/api/people", json=payload, headers={"Origin": "https://duty.example.by"}
+    ).status_code == 200
+
+    assert client.get("/api/people", headers=foreign).status_code == 200
+    assert client.delete("/api/people/999999", headers=foreign).status_code == 403
+
+
+def test_login_ip_rate_limit(client: TestClient):
+    reset_login_failures()
+    main_module._login_failures["ip:testclient"] = [
+        time.monotonic()
+    ] * main_module.LOGIN_IP_MAX_ATTEMPTS
+
+    anonymous = TestClient(app)
+    response = anonymous.post(
+        "/api/auth/login", json={"username": "ghost", "password": "wrong-pass"}
+    )
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) >= 1
+    reset_login_failures()
+
+
+def test_login_pruning_keeps_active_locks(client: TestClient):
+    reset_login_failures()
+    now = time.monotonic()
+    for index in range(1001):
+        main_module._login_failures[f"user:stale-{index}"] = [now - 400]
+    main_module._login_failures["user:testclient|ghost"] = [now] * 5
+
+    anonymous = TestClient(app)
+    response = anonymous.post(
+        "/api/auth/login", json={"username": "ghost", "password": "wrong-pass"}
+    )
+    assert response.status_code == 401
+    assert len(main_module._login_failures["user:testclient|ghost"]) == 6
+    assert not any(key.startswith("user:stale-") for key in main_module._login_failures)
+    reset_login_failures()
+
+
+def test_login_unknown_user_uses_dummy_hash(client: TestClient, monkeypatch):
+    calls: list[str] = []
+    original = security.verify_password
+
+    def spy(password: str, stored: str) -> bool:
+        calls.append(stored)
+        return original(password, stored)
+
+    monkeypatch.setattr(security, "verify_password", spy)
+    anonymous = TestClient(app)
+    response = anonymous.post(
+        "/api/auth/login", json={"username": "nobody", "password": "whatever1"}
+    )
+    assert response.status_code == 401
+    assert calls == [main_module._DUMMY_PASSWORD_HASH]
+
+
+def test_login_rehashes_legacy_password(client: TestClient):
+    person = add_person(client, "Иванов")
+    add_account(client, person, "ivanov")
+    salt = b"0123456789abcdef"
+    digest = hashlib.pbkdf2_hmac("sha256", b"pass1234", salt, 1000)
+    legacy = "pbkdf2_sha256${}${}${}".format(
+        1000,
+        base64.urlsafe_b64encode(salt).decode(),
+        base64.urlsafe_b64encode(digest).decode(),
+    )
+    with db.db() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE username = 'ivanov'", (legacy,)
+        )
+
+    response = TestClient(app).post(
+        "/api/auth/login", json={"username": "ivanov", "password": "pass1234"}
+    )
+    assert response.status_code == 200
+    with db.db() as conn:
+        stored = conn.execute(
+            "SELECT password_hash FROM users WHERE username = 'ivanov'"
+        ).fetchone()["password_hash"]
+    assert security.hash_iterations(stored) == security.PBKDF2_ITERATIONS
+    assert security.verify_password("pass1234", stored)
+
+
+def test_proof_available_to_employee(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    petrov = add_person(client, "Петров")
+    drawn = client.post(
+        "/api/draw",
+        json={
+            "date": MONDAY.isoformat(),
+            "candidate_ids": [ivanov, petrov],
+            "seed": 99,
+        },
+    )
+    assert drawn.status_code == 200
+    draw_id = drawn.json()["drawId"]
+
+    add_account(client, ivanov, "ivanov")
+    employee = login_as("ivanov")
+    proof = employee.get(f"/api/proof/{draw_id}")
+    assert proof.status_code == 200
+    assert proof.json()["available"] is True
+    assert employee.get(f"/proof/{draw_id}").status_code == 200
+
+
+def test_audit_log_admin_only_and_contents(client: TestClient):
+    ivanov = add_person(client, "Иванов")
+    created = client.post(
+        "/api/duties", json={"date": MONDAY.isoformat(), "person_id": ivanov}
+    )
+    assert created.status_code == 200
+    duty_id = created.json()["duty"]["id"]
+    assert client.put(
+        "/api/settings", json={"unit_name": "Смена"}
+    ).status_code == 200
+    add_account(client, ivanov, "ivanov")
+
+    anonymous = TestClient(app)
+    anonymous.post(
+        "/api/auth/login", json={"username": "ghost", "password": "top-secret-123"}
+    )
+
+    payload = client.get("/api/audit", params={"limit": 100}).json()
+    events = payload["events"]
+    assert payload["total"] >= len(events)
+    assert events
+    assert events[0]["at"] >= events[-1]["at"]
+    actions = {item["action"] for item in events}
+    assert {
+        "login_success",
+        "login_failure",
+        "duty_create",
+        "settings_update",
+        "user_create",
+    } <= actions
+
+    duty_event = next(item for item in events if item["action"] == "duty_create")
+    assert duty_event["entity_id"] == str(duty_id)
+    assert "person_id" in (duty_event["details"] or "")
+
+    settings_event = next(
+        item for item in events if item["action"] == "settings_update"
+    )
+    assert "unit_name" in (settings_event["details"] or "")
+    assert "Смена" not in (settings_event["details"] or "")
+
+    failure = next(item for item in events if item["action"] == "login_failure")
+    assert "ghost" in (failure["details"] or "")
+    assert "top-secret-123" not in (failure["details"] or "")
+
+    with db.db() as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(audit_log)")
+        }
+    assert columns == {
+        "id", "at", "actor_id", "actor_name", "action",
+        "entity", "entity_id", "details", "ip",
+    }
+
+    first_page = client.get("/api/audit", params={"limit": 1, "offset": 0}).json()
+    second_page = client.get("/api/audit", params={"limit": 1, "offset": 1}).json()
+    assert len(first_page["events"]) == 1
+    assert len(second_page["events"]) == 1
+    assert first_page["events"][0]["id"] != second_page["events"][0]["id"]
+
+    lead_person = add_person(client, "Тимлид")
+    add_account(client, lead_person, "lead", role="teamlead")
+    teamlead = login_as("lead")
+    assert teamlead.get("/api/audit").status_code == 403
+    employee = login_as("ivanov")
+    assert employee.get("/api/audit").status_code == 403
+
+
+def test_notification_test_requires_enabled(client: TestClient):
+    with db.db() as conn:
+        conn.execute(
+            "UPDATE users SET email = 'admin@example.by' WHERE username = 'admin'"
+        )
+    response = client.post("/api/notifications/test", json={"channel": "email"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert "отключ" in body["error"].lower()
+    with db.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notification_outbox"
+        ).fetchone()[0] == 0
+
+
+def test_coverage_alert_cleanup_runs_without_notifications(client: TestClient):
+    """P3: устаревшие coverage_alerts чистятся и при выключенных уведомлениях."""
+    ivanov = add_person(client, "Иванов")
+    target = (date.today() + timedelta(days=10)).isoformat()
+    stale_day = (date.today() + timedelta(days=400)).isoformat()
+    with db.db() as conn:
+        conn.execute("INSERT INTO coverage_alerts(date) VALUES(?)", (stale_day,))
+
+    absence = client.post(
+        "/api/absences",
+        json={
+            "person_id": ivanov,
+            "date_from": target,
+            "date_to": target,
+            "kind": "vacation",
+        },
+    )
+    assert absence.status_code == 200
+    absence_id = absence.json()["absence"]["id"]
+
+    with db.db() as conn:
+        dates = {
+            row["date"] for row in conn.execute("SELECT date FROM coverage_alerts")
+        }
+        assert stale_day not in dates
+        # Уведомления выключены: новые алерты не появляются.
+        assert dates == set()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notification_outbox"
+        ).fetchone()[0] == 0
+
+    assert client.delete(f"/api/absences/{absence_id}").status_code == 200
+    with db.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coverage_alerts"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notification_outbox"
+        ).fetchone()[0] == 0
+
+
+def test_coverage_alerts_enqueue_and_cleanup_when_enabled(client: TestClient):
+    """При включённых уведомлениях прежнее поведение сохраняется."""
+    ivanov = add_person(client, "Иванов")
+    with db.db() as conn:
+        conn.execute(
+            "UPDATE users SET email = 'lead@example.by' WHERE username = 'admin'"
+        )
+    enabled = client.put("/api/settings", json={"notifications_enabled": True})
+    assert enabled.status_code == 200
+
+    target = (date.today() + timedelta(days=10)).isoformat()
+    absence = client.post(
+        "/api/absences",
+        json={
+            "person_id": ivanov,
+            "date_from": target,
+            "date_to": target,
+            "kind": "vacation",
+        },
+    )
+    assert absence.status_code == 200
+    absence_id = absence.json()["absence"]["id"]
+    with db.db() as conn:
+        dates = {
+            row["date"] for row in conn.execute("SELECT date FROM coverage_alerts")
+        }
+        assert target in dates
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event = 'coverage_gap'"
+        ).fetchone()[0] >= 1
+
+    assert client.delete(f"/api/absences/{absence_id}").status_code == 200
+    with db.db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM coverage_alerts WHERE date = ?", (target,)
+        ).fetchone()[0] == 0
+
+
+def test_absence_overlap_author_and_audit(client: TestClient, monkeypatch):
+    ivanov = add_person(client, "Иванов")
+    finish = MONDAY + timedelta(days=2)
+    first = client.post(
+        "/api/absences",
+        json={
+            "person_id": ivanov,
+            "date_from": MONDAY.isoformat(),
+            "date_to": finish.isoformat(),
+            "kind": "vacation",
+        },
+    )
+    assert first.status_code == 200
+    absence_id = first.json()["absence"]["id"]
+    with db.db() as conn:
+        created_by = conn.execute(
+            "SELECT created_by FROM absences WHERE id = ?", (absence_id,)
+        ).fetchone()["created_by"]
+        admin_id = conn.execute(
+            "SELECT id FROM users WHERE username = 'admin'"
+        ).fetchone()["id"]
+    assert created_by == admin_id
+
+    overlap = client.post(
+        "/api/absences",
+        json={
+            "person_id": ivanov,
+            "date_from": (MONDAY + timedelta(days=1)).isoformat(),
+            "date_to": (finish + timedelta(days=2)).isoformat(),
+            "kind": "sick",
+        },
+    )
+    assert overlap.status_code == 409
+    assert "уже оформлено отсутствие" in overlap.json()["detail"]
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        main_module, "refresh_coverage_alerts", lambda: calls.append(1) or 0
+    )
+    deleted = client.delete(f"/api/absences/{absence_id}")
+    assert deleted.status_code == 200
+    assert calls
+
+    events = client.get("/api/audit").json()["events"]
+    assert any(
+        item["action"] == "absence_delete" and item["entity_id"] == str(absence_id)
+        for item in events
+    )
+
+
+def test_csv_export_rejects_long_range(client: TestClient):
+    too_long = client.get(
+        "/api/export",
+        params={"date_from": "2026-01-01", "date_to": "2027-01-03"},
+    )
+    assert too_long.status_code == 400
+    assert "367" in too_long.json()["detail"]
+
+    allowed = client.get(
+        "/api/export",
+        params={"date_from": "2026-01-01", "date_to": "2027-01-02"},
+    )
+    assert allowed.status_code == 200
+
+
+def test_proof_weights_consistency_detects_tampering():
+    payload = {
+        "algorithm": proofs.ALGORITHM,
+        "version": 1,
+        "date": MONDAY.isoformat(),
+        "mode": "load",
+        "seed": 1,
+        "roll": 0.4,
+        "power": 2,
+        "weekendWeight": 1.5,
+        "month": None,
+        "winnerId": 1,
+        "winnerName": "Иванов",
+        "candidates": [
+            {
+                "personId": 1,
+                "name": "Иванов",
+                "weight": 4.0,
+                "probability": 0.8,
+                "weightedLoad": 0.0,
+                "monthDuties": 0,
+            },
+            {
+                "personId": 2,
+                "name": "Петров",
+                "weight": 1.0,
+                "probability": 0.2,
+                "weightedLoad": 1.0,
+                "monthDuties": 0,
+            },
+        ],
+    }
+    good = proofs.verify(payload, proofs.digest(payload))
+    assert good["verified"] is True
+    assert good["checks"]["weightsConsistent"] is True
+
+    tampered = {
+        **payload,
+        "candidates": [
+            {**payload["candidates"][0], "weight": 3.0},
+            payload["candidates"][1],
+        ],
+    }
+    checked = proofs.verify(tampered, proofs.digest(tampered))
+    assert checked["checks"]["weightsConsistent"] is False
+    assert checked["verified"] is False
+
+
+def test_audit_ui_and_requirements_assets(client: TestClient):
+    app_js = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "Журнал действий" in app_js
+    assert "/api/audit?limit=50" in app_js
+    i18n_js = (ROOT / "app" / "static" / "i18n.js").read_text(encoding="utf-8")
+    assert '"Журнал действий": "Action log"' in i18n_js
+    assert '"✓ Веса соответствуют правилу режима"' in i18n_js
+
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    for pin in (
+        "fastapi==0.162.2",
+        "starlette==1.10.0",
+        "pydantic==2.14.3",
+        "pydantic_core==2.50.4",
+        "pydantic-settings==2.16.2",
+        "uvicorn==0.54.0",
+        "httpx==0.28.1",
+        "Jinja2==3.1.6",
+        "python-multipart==0.0.33",
+        "pytest==9.2.0",
+        "pytest-asyncio==1.4.1.post1",
+    ):
+        assert pin in requirements
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "pip install -r requirements.txt" in readme
+    assert "/api/audit" in readme
+    assert "367 дней" in readme
 

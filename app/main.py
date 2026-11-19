@@ -12,7 +12,7 @@ import tempfile
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -89,6 +89,7 @@ ROLE_LABELS = {
 SESSION_COOKIE = "duty_session"
 LOGIN_MAX_ATTEMPTS = 10
 LOGIN_WINDOW_SECONDS = 300
+LOGIN_IP_MAX_ATTEMPTS = 50
 CSP_HEADER = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
@@ -97,14 +98,32 @@ CSP_HEADER = (
 )
 
 _login_failures: dict[str, list[float]] = {}
+# Фиктивный хэш: холостая проверка при неизвестном логине выравнивает время
+# ответа и не даёт перечислять учётные записи по задержке.
+_DUMMY_PASSWORD_HASH = security.hash_password("duty-service-dummy-password")
+
+
+def _client_host(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 def _login_key(request: Request, username: str) -> str:
-    host = request.client.host if request.client else "unknown"
-    return f"{host}|{username.strip().lower()}"
+    return f"user:{_client_host(request)}|{username.strip().lower()}"
 
 
-def login_retry_after(key: str) -> int:
+def login_ip_key(request: Request) -> str:
+    return f"ip:{_client_host(request)}"
+
+
+def _prune_expired(now: float) -> None:
+    """Удаляет только истёкшие записи, не сбрасывая активные блокировки."""
+    for key in list(_login_failures):
+        stamps = _login_failures.get(key) or []
+        if not stamps or now - stamps[-1] >= LOGIN_WINDOW_SECONDS:
+            _login_failures.pop(key, None)
+
+
+def _retry_after(key: str, limit: int) -> int:
     now = time.monotonic()
     attempts = [
         stamp
@@ -115,15 +134,26 @@ def login_retry_after(key: str) -> int:
         _login_failures[key] = attempts
     else:
         _login_failures.pop(key, None)
-    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+    if len(attempts) >= limit:
         return max(1, int(LOGIN_WINDOW_SECONDS - (now - attempts[0])) + 1)
     return 0
 
 
-def note_login_failure(key: str) -> None:
+def login_retry_after(key: str) -> int:
+    return _retry_after(key, LOGIN_MAX_ATTEMPTS)
+
+
+def login_ip_retry_after(key: str) -> int:
+    return _retry_after(key, LOGIN_IP_MAX_ATTEMPTS)
+
+
+def note_login_failure(key: str, ip_key: str | None = None) -> None:
+    now = time.monotonic()
     if len(_login_failures) > 1000:
-        _login_failures.clear()
-    _login_failures.setdefault(key, []).append(time.monotonic())
+        _prune_expired(now)
+    _login_failures.setdefault(key, []).append(now)
+    if ip_key:
+        _login_failures.setdefault(ip_key, []).append(now)
 
 
 def reset_login_failures() -> None:
@@ -360,8 +390,12 @@ def month_bounds(month: str) -> tuple[date, date]:
     return start, next_start
 
 
-def settings_out(settings: dict[str, str]) -> dict[str, Any]:
+def settings_out(settings: dict[str, str], role: str = "admin") -> dict[str, Any]:
+    """Настройки для клиента. Секреты уведомлений видит только администратор."""
     rules = engine.Rules.from_settings(settings)
+    full = role == "admin"
+    smtp_host = settings.get("smtp_host", "")
+    webhook = settings.get("rocketchat_webhook", "")
     return {
         "unit_name": settings.get("unit_name", "Дежурная служба"),
         "rest_days": rules.rest_days,
@@ -377,15 +411,54 @@ def settings_out(settings: dict[str, str]) -> dict[str, Any]:
         "notify_on_request": settings.get("notify_on_request", "1") == "1",
         "notify_on_decision": settings.get("notify_on_decision", "1") == "1",
         "notify_on_coverage": settings.get("notify_on_coverage", "1") == "1",
-        "smtp_host": settings.get("smtp_host", ""),
+        "smtp_host": smtp_host if full else "",
         "smtp_port": int(settings.get("smtp_port", 587)),
-        "smtp_user": settings.get("smtp_user", ""),
-        "smtp_from": settings.get("smtp_from", ""),
+        "smtp_user": settings.get("smtp_user", "") if full else "",
+        "smtp_from": settings.get("smtp_from", "") if full else "",
         "smtp_tls": settings.get("smtp_tls", "1") == "1",
         "smtp_password_set": bool(settings.get("smtp_password", "")),
-        "rocketchat_webhook": settings.get("rocketchat_webhook", ""),
+        "smtp_configured": bool(smtp_host.strip()),
+        "rocketchat_webhook": webhook if full else "",
+        "rocketchat_webhook_set": bool(webhook.strip()),
         "public_url": settings.get("public_url", "http://127.0.0.1:8000"),
     }
+
+
+def audit(
+    conn: sqlite3.Connection,
+    request: Request | None,
+    action: str,
+    entity: str | None = None,
+    entity_id: int | str | None = None,
+    details: Any = None,
+) -> None:
+    """Журнал действий: кто, что, над чем. Пароли и токены не пишем."""
+    user = getattr(request.state, "user", None) if request is not None else None
+    actor_id = int(user["id"]) if user else None
+    actor_name = user["username"] if user else None
+    ip = _client_host(request) if request is not None else None
+    payload: str | None = None
+    if details is not None:
+        payload = (
+            details
+            if isinstance(details, str)
+            else json.dumps(details, ensure_ascii=False)
+        )
+    conn.execute(
+        "INSERT INTO audit_log"
+        "(at, actor_id, actor_name, action, entity, entity_id, details, ip) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            actor_id,
+            actor_name,
+            action,
+            entity,
+            None if entity_id is None else str(entity_id),
+            payload,
+            ip,
+        ),
+    )
 
 
 def load_people(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -857,14 +930,13 @@ def coverage_gaps(
 
 
 def refresh_coverage_alerts() -> int:
-    """Уведомляет тимлидов о новых днях без доступных сотрудников."""
+    """Уведомляет тимлидов о новых днях без доступных сотрудников.
+
+    Очистка устаревших записей выполняется при любых настройках уведомлений:
+    иначе после их выключения в coverage_alerts остаются закрытые дни.
+    """
     with db.db() as conn:
         settings = db.load_settings(conn)
-        if (
-            settings.get("notifications_enabled", "0") != "1"
-            or settings.get("notify_on_coverage", "1") != "1"
-        ):
-            return 0
         horizon = int(settings.get("request_horizon_days", 90))
         gaps = coverage_gaps(conn, today(), today() + timedelta(days=horizon))
         gap_dates = {gap["date"] for gap in gaps}
@@ -882,6 +954,11 @@ def refresh_coverage_alerts() -> int:
 
     fresh = sorted(gap_dates - alerted)
     if not fresh:
+        return 0
+    if (
+        settings.get("notifications_enabled", "0") != "1"
+        or settings.get("notify_on_coverage", "1") != "1"
+    ):
         return 0
     with db.db() as conn:
         base = db.load_settings(conn).get("public_url", "").rstrip("/")
@@ -923,6 +1000,33 @@ def _session_secret() -> str:
     return app.state.session_secret
 
 
+def _origin_allowed(request: Request, origin: str) -> bool:
+    """Сверяет Origin с текущим хостом и настроенным публичным адресом."""
+    parsed = urlparse(origin)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.netloc == request.url.netloc:
+        return True
+    try:
+        with db.db() as conn:
+            public_url = db.load_settings(conn).get("public_url", "")
+    except sqlite3.Error:
+        return False
+    base = urlparse(public_url)
+    return bool(base.netloc and parsed.netloc == base.netloc)
+
+
+def _csrf_allowed(request: Request) -> bool:
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return True
+    origin = request.headers.get("origin")
+    if not origin:
+        # Клиенты без Origin (curl, тесты) не уязвимы к CSRF браузера;
+        # SameSite=Lax остаётся вторым барьером.
+        return True
+    return _origin_allowed(request, origin)
+
+
 @app.middleware("http")
 async def rbac_middleware(request: Request, call_next):
     path = request.url.path
@@ -960,6 +1064,11 @@ async def rbac_middleware(request: Request, call_next):
             return JSONResponse({"detail": "Требуется вход"}, status_code=401)
         return RedirectResponse("/login", status_code=303)
 
+    if not _csrf_allowed(request):
+        return JSONResponse(
+            {"detail": "Запрос отклонён: недопустимый источник"}, status_code=403
+        )
+
     role = user["role"]
     if path == "/":
         if role == "employee":
@@ -969,9 +1078,17 @@ async def rbac_middleware(request: Request, call_next):
         if role != "employee":
             return RedirectResponse("/", status_code=303)
         return await call_next(request)
+    if path in ("/docs", "/redoc", "/openapi.json"):
+        if role != "admin":
+            return JSONResponse(
+                {"detail": "Доступно только администратору"}, status_code=403
+            )
+        return await call_next(request)
     if path.startswith("/api/auth/") or path.startswith("/api/me"):
         return await call_next(request)
     if not path.startswith("/api/"):
+        return await call_next(request)
+    if path.startswith("/api/proof/"):
         return await call_next(request)
     if role == "employee":
         return JSONResponse({"detail": "Недостаточно прав"}, status_code=403)
@@ -979,6 +1096,7 @@ async def rbac_middleware(request: Request, call_next):
         path.startswith("/api/users")
         or path.startswith("/api/notifications")
         or path.startswith("/api/backup")
+        or path.startswith("/api/audit")
     ):
         if role != "admin":
             return JSONResponse(
@@ -1030,7 +1148,8 @@ def login(payload: LoginIn, request: Request, response: Response) -> dict[str, A
     if not username or not payload.password:
         raise HTTPException(status_code=400, detail="Укажите логин и пароль")
     key = _login_key(request, username)
-    retry_after = login_retry_after(key)
+    ip_key = login_ip_key(request)
+    retry_after = login_retry_after(key) or login_ip_retry_after(ip_key)
     if retry_after:
         raise HTTPException(
             status_code=429,
@@ -1044,20 +1163,39 @@ def login(payload: LoginIn, request: Request, response: Response) -> dict[str, A
         row = conn.execute(
             "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
         ).fetchone()
-        if (
-            not row
-            or not row["active"]
-            or not security.verify_password(payload.password, row["password_hash"])
-        ):
-            note_login_failure(key)
+        if row is None:
+            # Холостая проверка делает время ответа сопоставимым с существующим
+            # пользователем и мешает перечислению логинов.
+            security.verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+            valid = False
+        else:
+            valid = bool(row["active"]) and security.verify_password(
+                payload.password, row["password_hash"]
+            )
+        if not valid:
+            note_login_failure(key, ip_key)
+            audit(
+                conn,
+                request,
+                "login_failure",
+                entity="auth",
+                details={"username": username},
+            )
             raise HTTPException(status_code=401, detail="Неверный логин или пароль")
         _login_failures.pop(key, None)
+        if security.needs_rehash(row["password_hash"]):
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (security.hash_password(payload.password), int(row["id"])),
+            )
         conn.execute(
             "UPDATE users SET last_login_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             "WHERE id = ?",
             (row["id"],),
         )
         row = _user_row(conn, int(row["id"]))
+        request.state.user = dict(row)
+        audit(conn, request, "login_success", entity="auth")
     token = security.create_session(
         int(row["id"]),
         row["role"],
@@ -1156,7 +1294,7 @@ def users_list() -> dict[str, Any]:
 
 
 @app.post("/api/users")
-def create_user(payload: UserIn) -> dict[str, Any]:
+def create_user(payload: UserIn, request: Request) -> dict[str, Any]:
     if payload.role not in ROLE_LABELS:
         raise HTTPException(status_code=400, detail="Некорректная роль")
     username = _validate_username(payload.username)
@@ -1183,11 +1321,19 @@ def create_user(payload: UserIn) -> dict[str, Any]:
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="Такой логин уже занят")
         row = _user_row(conn, int(cursor.lastrowid))
+        audit(
+            conn,
+            request,
+            "user_create",
+            entity="user",
+            entity_id=int(row["id"]),
+            details={"username": username, "role": payload.role},
+        )
     return {"user": user_out(dict(row))}
 
 
 @app.patch("/api/users/{user_id}")
-def update_user(user_id: int, payload: UserPatch) -> dict[str, Any]:
+def update_user(user_id: int, payload: UserPatch, request: Request) -> dict[str, Any]:
     fields = payload.model_fields_set
     with db.db() as conn:
         current = _user_row(conn, user_id)
@@ -1240,6 +1386,14 @@ def update_user(user_id: int, payload: UserPatch) -> dict[str, Any]:
             except sqlite3.IntegrityError:
                 raise HTTPException(status_code=409, detail="Такой логин уже занят")
         row = _user_row(conn, user_id)
+        audit(
+            conn,
+            request,
+            "user_update",
+            entity="user",
+            entity_id=user_id,
+            details={"keys": sorted(updates)},
+        )
     return {"user": user_out(dict(row))}
 
 
@@ -1260,11 +1414,19 @@ def delete_user(user_id: int, request: Request) -> dict[str, str]:
                     detail="Нельзя оставить систему без активного администратора",
                 )
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        audit(
+            conn,
+            request,
+            "user_delete",
+            entity="user",
+            entity_id=user_id,
+            details={"username": current["username"]},
+        )
     return {"status": "deleted"}
 
 
 @app.get("/api/schedule")
-def schedule(month: str | None = None) -> dict[str, Any]:
+def schedule(request: Request, month: str | None = None) -> dict[str, Any]:
     month = month or today().strftime("%Y-%m")
     start, next_start = month_bounds(month)
     grid_from = start - timedelta(days=start.weekday())
@@ -1338,23 +1500,23 @@ def schedule(month: str | None = None) -> dict[str, Any]:
             cursor += timedelta(days=1)
 
     requests_by_date: dict[str, list[dict[str, Any]]] = {}
-    for request in requests:
-        if request["status"] == "declined":
+    for availability in requests:
+        if availability["status"] == "declined":
             continue
-        cursor = engine.as_date(request["date_from"])
-        finish = engine.as_date(request["date_to"])
+        cursor = engine.as_date(availability["date_from"])
+        finish = engine.as_date(availability["date_to"])
         while cursor <= finish:
             if grid_from <= cursor <= grid_to:
                 requests_by_date.setdefault(cursor.isoformat(), []).append(
                     {
-                        "id": request["id"],
-                        "personId": int(request["person_id"]),
-                        "personName": request["person_name"],
-                        "kind": request["kind"],
-                        "status": request["status"],
-                        "dateFrom": request["date_from"],
-                        "dateTo": request["date_to"],
-                        "reason": request["reason"],
+                        "id": availability["id"],
+                        "personId": int(availability["person_id"]),
+                        "personName": availability["person_name"],
+                        "kind": availability["kind"],
+                        "status": availability["status"],
+                        "dateFrom": availability["date_from"],
+                        "dateTo": availability["date_to"],
+                        "reason": availability["reason"],
                     }
                 )
             cursor += timedelta(days=1)
@@ -1417,7 +1579,7 @@ def schedule(month: str | None = None) -> dict[str, Any]:
         "month": month,
         "gridFrom": grid_from.isoformat(),
         "gridTo": grid_to.isoformat(),
-        "settings": settings_out(settings),
+        "settings": settings_out(settings, current_user(request)["role"]),
         "people": [
             {
                 "id": int(p["id"]),
@@ -1443,6 +1605,7 @@ def schedule(month: str | None = None) -> dict[str, Any]:
 
 @app.get("/api/candidates")
 def candidates(
+    request: Request,
     day: str = Query(..., alias="date"),
     selected: str | None = None,
 ) -> dict[str, Any]:
@@ -1493,7 +1656,7 @@ def candidates(
             "comp_enabled": rules.comp_enabled,
             "comp_valid_days": rules.comp_valid_days,
         },
-        "settings": settings_out(settings),
+        "settings": settings_out(settings, current_user(request)["role"]),
     }
 
 
@@ -1579,7 +1742,7 @@ def roulette_preview(
 
 
 @app.post("/api/duties")
-def create_duty(payload: DutyIn) -> dict[str, Any]:
+def create_duty(payload: DutyIn, request: Request) -> dict[str, Any]:
     target = parse_day(payload.date)
     target_iso = target.isoformat()
     with db.db() as conn:
@@ -1630,11 +1793,19 @@ def create_duty(payload: DutyIn) -> dict[str, Any]:
         duty = conn.execute(
             "SELECT * FROM duties WHERE id = ?", (cursor.lastrowid,)
         ).fetchone()
+        audit(
+            conn,
+            request,
+            "duty_create",
+            entity="duty",
+            entity_id=int(duty["id"]),
+            details={"date": target_iso, "person_id": payload.person_id},
+        )
     return {"duty": duty_out(dict(duty), names_map(people))}
 
 
 @app.patch("/api/duties/{duty_id}")
-def patch_duty(duty_id: int, payload: DutyPatch) -> dict[str, Any]:
+def patch_duty(duty_id: int, payload: DutyPatch, request: Request) -> dict[str, Any]:
     if payload.status not in DUTY_STATUS_LABELS:
         raise HTTPException(status_code=400, detail="Некорректный статус дежурства")
     with db.db() as conn:
@@ -1660,23 +1831,40 @@ def patch_duty(duty_id: int, payload: DutyPatch) -> dict[str, Any]:
         updated = conn.execute(
             "SELECT * FROM duties WHERE id = ?", (duty_id,)
         ).fetchone()
+        audit(
+            conn,
+            request,
+            "duty_update",
+            entity="duty",
+            entity_id=duty_id,
+            details={"from": duty["status"], "to": payload.status},
+        )
     if payload.status in ("cancelled", "missed"):
         refresh_coverage_alerts()
     return {"duty": duty_out(dict(updated), names_map(people))}
 
 
 @app.delete("/api/duties/{duty_id}")
-def delete_duty(duty_id: int) -> dict[str, str]:
+def delete_duty(duty_id: int, request: Request) -> dict[str, str]:
     with db.db() as conn:
+        row = conn.execute("SELECT * FROM duties WHERE id = ?", (duty_id,)).fetchone()
         cursor = conn.execute("DELETE FROM duties WHERE id = ?", (duty_id,))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Дежурство не найдено")
+        audit(
+            conn,
+            request,
+            "duty_delete",
+            entity="duty",
+            entity_id=duty_id,
+            details={"date": row["date"], "person_id": int(row["person_id"])},
+        )
     refresh_coverage_alerts()
     return {"status": "deleted"}
 
 
 @app.post("/api/draw")
-def draw(payload: DrawIn) -> dict[str, Any]:
+def draw(payload: DrawIn, request: Request) -> dict[str, Any]:
     target = parse_day(payload.date)
     target_iso = target.isoformat()
     if payload.seed is not None and not (0 <= payload.seed <= 2**63 - 1):
@@ -1852,6 +2040,18 @@ def draw(payload: DrawIn) -> dict[str, Any]:
                         proof_hash,
                     ),
                 )
+                audit(
+                    conn,
+                    request,
+                    "draw_replace" if occupied else "draw",
+                    entity="draw",
+                    entity_id=int(draw_cursor.lastrowid),
+                    details={
+                        "date": target_iso,
+                        "mode": payload.mode,
+                        "seed": int(seed),
+                    },
+                )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="День уже занят")
 
@@ -2023,6 +2223,10 @@ def _proof_page_html(record: dict[str, Any] | None, draw_id: int) -> str:
             for label, value in (
                 ("SHA-256 пакета совпадает с печатью", checks["hashMatches"]),
                 ("Сумма весов положительна", checks["weightsPositive"]),
+                (
+                    "Веса соответствуют правилу режима",
+                    checks.get("weightsConsistent", False),
+                ),
                 ("Сумма вероятностей равна 1", checks["probabilitiesSum"]),
                 ("Пересчёт даёт указанного победителя", checks["winnerMatches"]),
             )
@@ -2265,7 +2469,7 @@ def absences_list() -> dict[str, Any]:
 
 
 @app.post("/api/absences")
-def create_absence(payload: AbsenceIn) -> dict[str, Any]:
+def create_absence(payload: AbsenceIn, request: Request) -> dict[str, Any]:
     if payload.kind not in ABSENCE_KIND_LABELS:
         raise HTTPException(status_code=400, detail="Некорректный тип отсутствия")
     start = parse_day(payload.date_from, "дата начала")
@@ -2274,12 +2478,27 @@ def create_absence(payload: AbsenceIn) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Дата окончания раньше даты начала")
     if (finish - start).days > 365:
         raise HTTPException(status_code=400, detail="Слишком длинный период отсутствия")
+    user = current_user(request)
     with db.db() as conn:
         person = conn.execute(
             "SELECT * FROM people WHERE id = ?", (payload.person_id,)
         ).fetchone()
         if not person:
             raise HTTPException(status_code=404, detail="Сотрудник не найден")
+        overlap = conn.execute(
+            "SELECT date_from, date_to FROM absences "
+            "WHERE person_id = ? AND date_from <= ? AND date_to >= ?",
+            (payload.person_id, finish.isoformat(), start.isoformat()),
+        ).fetchone()
+        if overlap:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "На эти дни уже оформлено отсутствие "
+                    f"{engine.as_date(overlap['date_from']):%d.%m.%Y}–"
+                    f"{engine.as_date(overlap['date_to']):%d.%m.%Y}."
+                ),
+            )
         conflicts = [
             row["date"]
             for row in conn.execute(
@@ -2294,14 +2513,15 @@ def create_absence(payload: AbsenceIn) -> dict[str, Any]:
                 detail="Сначала снимите дежурства на эти даты: " + ", ".join(conflicts),
             )
         cursor = conn.execute(
-            "INSERT INTO absences(person_id, date_from, date_to, kind, note) "
-            "VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO absences(person_id, date_from, date_to, kind, note, created_by) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
             (
                 payload.person_id,
                 start.isoformat(),
                 finish.isoformat(),
                 payload.kind,
                 payload.note.strip()[:200],
+                int(user["id"]),
             ),
         )
         row = conn.execute(
@@ -2309,16 +2529,45 @@ def create_absence(payload: AbsenceIn) -> dict[str, Any]:
             "JOIN people p ON p.id = a.person_id WHERE a.id = ?",
             (cursor.lastrowid,),
         ).fetchone()
+        audit(
+            conn,
+            request,
+            "absence_create",
+            entity="absence",
+            entity_id=int(row["id"]),
+            details={
+                "person_id": payload.person_id,
+                "date_from": start.isoformat(),
+                "date_to": finish.isoformat(),
+                "kind": payload.kind,
+            },
+        )
     refresh_coverage_alerts()
     return {"absence": dict(row)}
 
 
 @app.delete("/api/absences/{absence_id}")
-def delete_absence(absence_id: int) -> dict[str, str]:
+def delete_absence(absence_id: int, request: Request) -> dict[str, str]:
     with db.db() as conn:
+        row = conn.execute(
+            "SELECT * FROM absences WHERE id = ?", (absence_id,)
+        ).fetchone()
         cursor = conn.execute("DELETE FROM absences WHERE id = ?", (absence_id,))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Отсутствие не найдено")
+        audit(
+            conn,
+            request,
+            "absence_delete",
+            entity="absence",
+            entity_id=absence_id,
+            details={
+                "person_id": int(row["person_id"]),
+                "date_from": row["date_from"],
+                "date_to": row["date_to"],
+            },
+        )
+    refresh_coverage_alerts()
     return {"status": "deleted"}
 
 
@@ -2350,7 +2599,9 @@ def requests_list(
 
 
 @app.patch("/api/requests/{request_id}")
-def decide_request(request_id: int, payload: RequestDecisionIn) -> dict[str, Any]:
+def decide_request(
+    request_id: int, payload: RequestDecisionIn, request: Request
+) -> dict[str, Any]:
     if payload.status not in ("approved", "declined"):
         raise HTTPException(status_code=400, detail="Некорректный статус заявки")
     with db.db() as conn:
@@ -2388,6 +2639,14 @@ def decide_request(request_id: int, payload: RequestDecisionIn) -> dict[str, Any
             "JOIN people p ON p.id = r.person_id WHERE r.id = ?",
             (request_id,),
         ).fetchone()
+        audit(
+            conn,
+            request,
+            "availability_update",
+            entity="availability",
+            entity_id=request_id,
+            details={"status": payload.status},
+        )
     result = request_out(dict(updated))
     notifier.enqueue(
         "request_decided",
@@ -2409,11 +2668,27 @@ def decide_request(request_id: int, payload: RequestDecisionIn) -> dict[str, Any
 
 
 @app.delete("/api/requests/{request_id}")
-def delete_request(request_id: int) -> dict[str, str]:
+def delete_request(request_id: int, request: Request) -> dict[str, str]:
     with db.db() as conn:
+        row = conn.execute(
+            "SELECT id, person_id, status FROM availability WHERE id = ?",
+            (request_id,),
+        ).fetchone()
         cursor = conn.execute("DELETE FROM availability WHERE id = ?", (request_id,))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Заявка не найдена")
+        audit(
+            conn,
+            request,
+            "availability_update",
+            entity="availability",
+            entity_id=request_id,
+            details={
+                "deleted": True,
+                "person_id": int(row["person_id"]),
+                "status": row["status"],
+            },
+        )
     return {"status": "deleted"}
 
 
@@ -2430,7 +2705,7 @@ def _absence_request_row(
 
 @app.patch("/api/absence-requests/{request_id}")
 def decide_absence_request(
-    request_id: int, payload: RequestDecisionIn
+    request_id: int, payload: RequestDecisionIn, request: Request
 ) -> dict[str, Any]:
     if payload.status not in ("approved", "declined"):
         raise HTTPException(status_code=400, detail="Некорректный статус заявки")
@@ -2503,6 +2778,17 @@ def decide_absence_request(
                     (request_id,),
                 )
         updated = _absence_request_row(conn, request_id)
+        audit(
+            conn,
+            request,
+            "absence_request_decide",
+            entity="absence_request",
+            entity_id=request_id,
+            details={
+                "status": payload.status,
+                "person_id": int(updated["person_id"]),
+            },
+        )
     result = absence_request_out(dict(updated))
     notifier.enqueue(
         "request_decided",
@@ -2523,7 +2809,7 @@ def decide_absence_request(
 
 
 @app.delete("/api/absence-requests/{request_id}")
-def delete_absence_request(request_id: int) -> dict[str, str]:
+def delete_absence_request(request_id: int, request: Request) -> dict[str, str]:
     with db.db() as conn:
         row = _absence_request_row(conn, request_id)
         if not row:
@@ -2532,6 +2818,18 @@ def delete_absence_request(request_id: int) -> dict[str, str]:
             if row["absence_id"] is not None:
                 conn.execute("DELETE FROM absences WHERE id = ?", (row["absence_id"],))
             conn.execute("DELETE FROM absence_requests WHERE id = ?", (request_id,))
+        audit(
+            conn,
+            request,
+            "availability_update",
+            entity="absence_request",
+            entity_id=request_id,
+            details={
+                "deleted": True,
+                "person_id": int(row["person_id"]),
+                "absence_id": row["absence_id"],
+            },
+        )
     refresh_coverage_alerts()
     return {"status": "deleted"}
 
@@ -2606,11 +2904,19 @@ def dismiss_coverage(
         conn.execute(
             "DELETE FROM coverage_alerts WHERE date = ?", (target.isoformat(),)
         )
+        audit(
+            conn,
+            request,
+            "coverage_dismiss",
+            entity="coverage",
+            entity_id=target.isoformat(),
+            details={"note": payload.note.strip()[:300]},
+        )
     return {"date": target.isoformat(), "status": "dismissed"}
 
 
 @app.delete("/api/coverage/{day}")
-def reopen_coverage(day: str) -> dict[str, str]:
+def reopen_coverage(day: str, request: Request) -> dict[str, str]:
     target = parse_day(day, "дата")
     with db.db() as conn:
         cursor = conn.execute(
@@ -2618,6 +2924,13 @@ def reopen_coverage(day: str) -> dict[str, str]:
         )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="День не снят с контроля")
+        audit(
+            conn,
+            request,
+            "coverage_reopen",
+            entity="coverage",
+            entity_id=target.isoformat(),
+        )
     return {"status": "reopened"}
 
 
@@ -2690,6 +3003,17 @@ def assign_coverage(
                 conn.execute(
                     "DELETE FROM coverage_alerts WHERE date = ?",
                     (target.isoformat(),),
+                )
+                audit(
+                    conn,
+                    request,
+                    "coverage_assign",
+                    entity="coverage",
+                    entity_id=target.isoformat(),
+                    details={
+                        "person_id": int(payload.person_id),
+                        "reason": reason[:300],
+                    },
                 )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="День уже занят")
@@ -2856,6 +3180,14 @@ def my_create_absence(payload: MyAbsenceIn, request: Request) -> dict[str, Any]:
             ),
         )
         row = _absence_request_row(conn, int(cursor.lastrowid))
+        audit(
+            conn,
+            request,
+            "availability_update",
+            entity="absence_request",
+            entity_id=int(cursor.lastrowid),
+            details={"created": True, "kind": payload.kind},
+        )
 
     period = (
         f"{start:%d.%m.%Y}–{finish:%d.%m.%Y}" if start != finish else f"{start:%d.%m.%Y}"
@@ -2891,6 +3223,14 @@ def my_delete_absence(request_id: int, request: Request) -> dict[str, str]:
                 detail="Отозвать можно только заявку, ожидающую согласования",
             )
         conn.execute("DELETE FROM absence_requests WHERE id = ?", (request_id,))
+        audit(
+            conn,
+            request,
+            "availability_update",
+            entity="absence_request",
+            entity_id=request_id,
+            details={"deleted": True, "kind": row["kind"]},
+        )
     return {"status": "deleted"}
 
 
@@ -2937,6 +3277,15 @@ def my_create_request(payload: MyRequestIn, request: Request) -> dict[str, Any]:
             "ORDER BY r.date_from",
             created_ids,
         ).fetchall()
+        for created_id in created_ids:
+            audit(
+                conn,
+                request,
+                "availability_update",
+                entity="availability",
+                entity_id=created_id,
+                details={"created": True, "kind": payload.kind},
+            )
 
     periods = ", ".join(
         f"{start:%d.%m.%Y}–{finish:%d.%m.%Y}" if start != finish else f"{start:%d.%m.%Y}"
@@ -2976,6 +3325,14 @@ def my_delete_request(request_id: int, request: Request) -> dict[str, str]:
                 detail="Отозвать можно только заявку, ожидающую согласования",
             )
         conn.execute("DELETE FROM availability WHERE id = ?", (request_id,))
+        audit(
+            conn,
+            request,
+            "availability_update",
+            entity="availability",
+            entity_id=request_id,
+            details={"deleted": True, "kind": row["kind"]},
+        )
     return {"status": "deleted"}
 
 
@@ -3404,6 +3761,8 @@ def export_csv(
         start, next_start = month_bounds(month)
         finish = next_start - timedelta(days=1)
         label = month
+    if (finish - start).days > 366:
+        raise HTTPException(status_code=400, detail="Максимальный период — 367 дней")
 
     with db.db() as conn:
         _, rules = get_rules(conn)
@@ -3990,22 +4349,42 @@ def export_schedule_bw(
 
 
 @app.get("/api/backup")
-def download_backup() -> Response:
+def download_backup(request: Request) -> Response:
     source = sqlite3.connect(str(db.DB_PATH), timeout=15)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="duty_backup_"))
+    target_path = tmp_dir / "duty_backup.db"
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            target_path = Path(tmp) / "duty_backup.db"
-            target = sqlite3.connect(str(target_path))
-            try:
-                source.backup(target)
-                # WAL-снимок не переносится сам по себе: переводим копию
-                # в одиночный файл, чтобы её можно было открыть без .db-wal
-                target.execute("PRAGMA journal_mode=DELETE")
-            finally:
-                target.close()
-            content = target_path.read_bytes()
+        target = sqlite3.connect(str(target_path))
+        try:
+            source.backup(target)
+            # WAL-снимок не переносится сам по себе: переводим копию
+            # в одиночный файл, чтобы её можно было открыть без .db-wal
+            target.execute("PRAGMA journal_mode=DELETE")
+            # Копия не должна содержать секретов: после восстановления
+            # сессии становятся недействительными, а SMTP и вебхук
+            # настраиваются заново.
+            target.execute(
+                "DELETE FROM settings WHERE key IN "
+                "('session_secret', 'smtp_password', 'rocketchat_webhook')"
+            )
+            target.commit()
+            check = target.execute("PRAGMA integrity_check").fetchone()
+            if not check or check[0] != "ok":
+                raise HTTPException(
+                    status_code=500, detail="Не удалось проверить целостность копии"
+                )
+        finally:
+            target.close()
+        content = target_path.read_bytes()
     finally:
+        target_path.unlink(missing_ok=True)
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
         source.close()
+    with db.db() as conn:
+        audit(conn, request, "backup_download", entity="backup")
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     return Response(
         content=content,
@@ -4020,10 +4399,11 @@ def download_backup() -> Response:
 
 
 @app.get("/api/settings")
-def get_settings() -> dict[str, Any]:
+def get_settings(request: Request) -> dict[str, Any]:
+    user = current_user(request)
     with db.db() as conn:
         settings = db.load_settings(conn)
-    return {"settings": settings_out(settings)}
+    return {"settings": settings_out(settings, user["role"])}
 
 
 @app.put("/api/settings")
@@ -4112,7 +4492,15 @@ def update_settings(payload: SettingsIn, request: Request) -> dict[str, Any]:
                 ),
             )
         settings = db.save_settings(conn, updates)
-    return {"settings": settings_out(settings)}
+        # В журнал пишем только имена изменённых настроек, без значений.
+        audit(
+            conn,
+            request,
+            "settings_update",
+            entity="settings",
+            details={"keys": sorted(updates)},
+        )
+    return {"settings": settings_out(settings, current_user(request)["role"])}
 
 
 @app.get("/api/notifications")
@@ -4190,6 +4578,30 @@ def notification_test(
 @app.post("/api/notifications/retry")
 def notification_retry() -> dict[str, int]:
     return {"sent": notifier.retry_failed()}
+
+
+@app.get("/api/audit")
+def audit_list(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    with db.db() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT id, at, actor_id, actor_name, action, entity, entity_id, "
+                "details, ip FROM audit_log ORDER BY at DESC, id DESC "
+                "LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        ]
+        total = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+    return {
+        "events": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.exception_handler(sqlite3.IntegrityError)

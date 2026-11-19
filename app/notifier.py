@@ -102,13 +102,30 @@ def enqueue(
 
 
 def _spawn_flush() -> None:
-    threading.Thread(target=flush, daemon=True).start()
+    threading.Thread(target=_flush_safely, daemon=True).start()
+
+
+def _flush_safely() -> None:
+    """Фоновый запуск: любая ошибка не должна «убивать» обработку очереди."""
+    try:
+        flush()
+    except Exception:  # noqa: BLE001 - фоновая нить не должна падать
+        pass
 
 
 def send_test(channel: str, recipient: str, subject: str, body: str) -> dict[str, Any]:
     """Немедленная отправка одного сообщения с записью в журнал."""
     with db.db() as conn:
         settings = db.load_settings(conn)
+        if settings.get("notifications_enabled", "0") != "1":
+            return {
+                "id": None,
+                "status": "error",
+                "error": (
+                    "Уведомления отключены. Включите их в настройках, "
+                    "чтобы проверить канал."
+                ),
+            }
         cursor = conn.execute(
             "INSERT INTO notification_outbox"
             "(channel, recipient, subject, body, event) VALUES(?, ?, ?, ?, 'test')",
@@ -154,12 +171,22 @@ def _deliver_email(settings: dict[str, str], recipient: str, subject: str, body:
     message["To"] = recipient
     message.set_content(body)
     port = int(settings.get("smtp_port", "587"))
+    user = settings.get("smtp_user", "").strip()
+    if port == 465:
+        # Неявный TLS: шифрование с первого байта, STARTTLS не нужен.
+        with smtplib.SMTP_SSL(
+            host, port, timeout=10, context=ssl.create_default_context()
+        ) as client:
+            client.ehlo()
+            if user:
+                client.login(user, settings.get("smtp_password", ""))
+            client.send_message(message)
+        return
     with smtplib.SMTP(host, port, timeout=10) as client:
         client.ehlo()
         if settings.get("smtp_tls", "1") == "1":
             client.starttls(context=ssl.create_default_context())
             client.ehlo()
-        user = settings.get("smtp_user", "").strip()
         if user:
             client.login(user, settings.get("smtp_password", ""))
         client.send_message(message)
@@ -206,7 +233,7 @@ def flush(limit: int = 50) -> int:
         for row in rows:
             try:
                 _deliver(row, settings)
-            except (OSError, RuntimeError, smtplib.SMTPException, urllib.error.URLError) as error:
+            except Exception as error:  # noqa: BLE001 - ошибка канала не должна ронять поток
                 with db.db() as conn:
                     conn.execute(
                         "UPDATE notification_outbox SET status = 'error', "
@@ -222,6 +249,13 @@ def flush(limit: int = 50) -> int:
                         (row["id"],),
                     )
                 sent += 1
+        with db.db() as conn:
+            # Журнал отправки хранит персональные данные — старые записи чистим.
+            conn.execute(
+                "DELETE FROM notification_outbox WHERE status = 'sent' "
+                "AND sent_at IS NOT NULL "
+                "AND sent_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')"
+            )
     finally:
         _flush_lock.release()
     return sent

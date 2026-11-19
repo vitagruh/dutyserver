@@ -17,6 +17,27 @@
   const ROLE_LABEL = { admin: 'Администратор', teamlead: 'Тимлид', employee: 'Сотрудник' };
   const NOTIFY_STATUS = { pending: 'В очереди', sent: 'Отправлено', error: 'Ошибка', skipped: 'Пропущено' };
   const DRAW_MODE_LABEL = { load: 'По нагрузке', month: 'Дежурства за месяц', equal: 'Равные шансы' };
+  const AUDIT_ACTION = {
+    login_success: 'Вход',
+    login_failure: 'Неудачный вход',
+    draw: 'Жребий',
+    draw_replace: 'Переигровка дня',
+    duty_create: 'Дежурство назначено',
+    duty_update: 'Дежурство изменено',
+    duty_delete: 'Дежурство снято',
+    absence_create: 'Отсутствие добавлено',
+    absence_delete: 'Отсутствие удалено',
+    absence_request_decide: 'Решение по заявке',
+    availability_update: 'Заявка изменена',
+    settings_update: 'Настройки изменены',
+    user_create: 'Учётная запись создана',
+    user_update: 'Учётная запись изменена',
+    user_delete: 'Учётная запись удалена',
+    backup_download: 'Резервная копия',
+    coverage_assign: 'Назначение тимлида',
+    coverage_dismiss: 'День снят с контроля',
+    coverage_reopen: 'День возвращён на контроль',
+  };
 
   const S = {
     month: null,
@@ -36,6 +57,7 @@
     coverageData: null,
     usersData: null,
     notifications: null,
+    audit: null,
   };
 
   const el = (id) => document.getElementById(id);
@@ -2006,8 +2028,10 @@
     const holidays = [...S.holidays].sort((a, b) => a.date.localeCompare(b.date));
     if (isAdmin()) {
       S.notifications = await api('/api/notifications?limit=30');
+      S.audit = await api('/api/audit?limit=50');
     }
     const journal = S.notifications?.notifications || [];
+    const auditEvents = S.audit?.events || [];
 
     el('view').innerHTML = `
       <div class="page-head">
@@ -2209,6 +2233,33 @@
           <div class="btn-row">
             <a class="btn btn--primary" href="/api/backup">Скачать копию базы</a>
           </div>
+          <p class="small muted" style="margin-top:10px">В копии нет паролей SMTP и вебхука, а сессионный секрет очищен: после восстановления все сессии завершатся, каналы уведомлений нужно настроить заново.</p>
+        </section>
+
+        <section class="panel">
+          <div class="panel__head">
+            <h3>Журнал действий</h3>
+            <span class="small muted">последние ${auditEvents.length}</span>
+            <button class="btn btn--sm btn--ghost" type="button" id="refreshAuditBtn">Обновить</button>
+          </div>
+          ${auditEvents.length ? `
+            <div class="table-wrap">
+              <table class="table table--compact">
+                <thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Объект</th><th>Детали</th></tr></thead>
+                <tbody>
+                  ${auditEvents.map((item) => `
+                    <tr>
+                      <td class="nowrap small">${item.at ? `${fmtShort(item.at.slice(0, 10))} ${esc(item.at.slice(11, 16))}` : '—'}</td>
+                      <td class="small">${esc(item.actor_name || '—')}</td>
+                      <td class="small">${esc(AUDIT_ACTION[item.action] || item.action)}</td>
+                      <td class="small muted">${esc(item.entity || '')}${item.entity_id ? ` №${esc(item.entity_id)}` : ''}</td>
+                      <td class="small muted">${item.details ? esc(String(item.details).slice(0, 120)) : '—'}</td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          ` : '<div class="empty-state" style="padding:22px">Записей пока нет. Журнал заполняется при входах, решениях, назначениях и изменении настроек.</div>'}
         </section>
       ` : ''}
 
@@ -2322,6 +2373,14 @@
       el('retryNotifyBtn').addEventListener('click', act(async () => {
         const result = await api('/api/notifications/retry', { method: 'POST', body: {} });
         toast(`Повторно отправлено: ${result.sent}`);
+        await renderSettings();
+      }));
+    }
+
+    const refreshAuditBtn = el('refreshAuditBtn');
+    if (refreshAuditBtn) {
+      refreshAuditBtn.addEventListener('click', act(async () => {
+        S.audit = await api('/api/audit?limit=50');
         await renderSettings();
       }));
     }

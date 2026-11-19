@@ -59,6 +59,47 @@ def build_payload(
     }
 
 
+def _weights_consistent(
+    payload: dict[str, Any],
+    candidates: Sequence[dict[str, Any]],
+    power: int,
+) -> bool:
+    """Сверяет веса участников с правилом выбранного режима.
+
+    load  — (maxWeightedLoad − weightedLoad + 1)^power,
+    month — (maxMonthDuties − monthDuties + 1)^power,
+    equal — у всех участников вес 1.
+    """
+    if not candidates:
+        return False
+    eps = 1e-6
+    mode = str(payload.get("mode") or "load")
+    if mode == "equal":
+        return all(
+            abs(float(candidate.get("weight", 0.0)) - 1.0) <= eps
+            for candidate in candidates
+        )
+    if mode == "month":
+        top = max(int(candidate.get("monthDuties", 0)) for candidate in candidates)
+        return all(
+            abs(
+                float(candidate["weight"])
+                - float((top - int(candidate.get("monthDuties", 0)) + 1) ** power)
+            )
+            <= eps
+            for candidate in candidates
+        )
+    top = max(float(candidate.get("weightedLoad", 0.0)) for candidate in candidates)
+    return all(
+        abs(
+            float(candidate["weight"])
+            - float((top - float(candidate.get("weightedLoad", 0.0)) + 1.0) ** power)
+        )
+        <= eps
+        for candidate in candidates
+    )
+
+
 def verify(payload: dict[str, Any], expected_hash: str) -> dict[str, Any]:
     canonical = canonical_json(payload)
     computed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -68,6 +109,7 @@ def verify(payload: dict[str, Any], expected_hash: str) -> dict[str, Any]:
         if float(candidate.get("weight", 0)) > 0
     ]
     total = sum(float(candidate["weight"]) for candidate in candidates)
+    power = int(payload.get("power") or 1)
     roll = float(payload.get("roll", 0.0))
     threshold = roll * total
     acc = 0.0
@@ -98,6 +140,7 @@ def verify(payload: dict[str, Any], expected_hash: str) -> dict[str, Any]:
     checks = {
         "hashMatches": computed == expected_hash,
         "weightsPositive": bool(candidates) and total > 0,
+        "weightsConsistent": _weights_consistent(payload, candidates, power),
         "probabilitiesSum": abs(probabilities - 1.0) <= 1e-6 if candidates else False,
         "winnerMatches": bool(replayed)
         and int(replayed["personId"]) == winner_id,
